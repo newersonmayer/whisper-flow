@@ -42,6 +42,7 @@ if errorlevel 1 ( echo [ERRO] Falha ao instalar dependencias. & pause & exit /b 
 
 REM --- 4. Tarefa agendada: sobe no login e reinicia sozinho se cair ---
 echo Configurando inicializacao automatica...
+echo (vai aparecer um pedido de permissao do Windows - clique SIM)
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0registrar-tarefa.ps1"
 
 echo.

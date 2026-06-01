@@ -35,6 +35,9 @@ Dê **dois cliques em `instalar.bat`**. Ele:
 - cria o arquivo `.env` (onde vai a chave),
 - configura pra abrir no boot e se reiniciar sozinho se cair.
 
+> No fim vai aparecer um **pedido de permissão do Windows (UAC)** — clique **Sim**.
+> É só pra registrar a inicialização automática.
+
 ### 4. Cole a chave da API
 
 Peça a chave ao **Sr. Mayer**. Abra o arquivo `.env` (com o Bloco de Notas),
