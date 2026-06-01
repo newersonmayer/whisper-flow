@@ -91,11 +91,18 @@ Se você **baixou o ZIP**: baixe o ZIP novo, substitua os arquivos na pasta
 
 ## Para quem usa Claude Code (atualizar por chat)
 
-Se instalou via `git clone`, o `instalar.bat` gera o arquivo
-**`INSTRUCAO-CLAUDE-CODE.md`** com o caminho da sua instalação já preenchido.
-Cole o conteúdo dele no `CLAUDE.md` do seu projeto do Claude Code. Depois é só
-dizer **"atualize o whisper"** no chat — ele navega até a pasta, puxa a atualização
-do repositório, reinstala o que precisar e reinicia o programa. Seu `.env` é preservado.
+Instale via `git clone` (necessário pro auto-update). O `instalar.bat` gera o
+arquivo **`INSTRUCAO-CLAUDE-CODE.md`** com o caminho da instalação já preenchido.
+
+No Claude Code do seu projeto, diga **uma vez**:
+
+> "Leia o arquivo `INSTRUCAO-CLAUDE-CODE.md` em `<pasta onde você clonou>` e
+> adicione essa instrução ao meu `CLAUDE.md`."
+
+O próprio Claude escreve a instrução no seu `CLAUDE.md` — você não edita nada na mão.
+A partir daí, é só dizer **"atualize o whisper"** no chat que ele sozinho navega até
+a pasta, roda `git pull`, vê o que há de novo no repositório, reinstala o que mudou
+e reinicia o programa. Seu `.env` é preservado.
 
 ---
 
