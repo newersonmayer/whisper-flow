@@ -63,6 +63,21 @@ já com a chave). Pronto.
 
 - Rode **`desinstalar.bat`** (a pasta e o `.env` continuam onde estão).
 
+## Trocar a tecla de atalho
+
+Por padrão é **F9**. Pra mudar, abra o arquivo `.env`, edite a linha `HOTKEY=` com a
+tecla desejada (ex: `HOTKEY=f8`) e salve. Depois rode `parar.bat` e `instalar.bat`
+de novo (ou reinicie o PC). Use **teclas de função (f1..f12)** — letras atrapalham a
+digitação normal.
+
+## Como atualizar
+
+Se você **clonou com git** (`git clone`): na pasta do projeto, rode
+`git pull` e depois `instalar.bat` de novo. Seu `.env` (chave e tecla) é preservado.
+
+Se você **baixou o ZIP**: baixe o ZIP novo, substitua os arquivos na pasta
+(mantendo o seu `.env`) e rode `instalar.bat` de novo.
+
 ---
 
 ## Detalhes técnicos

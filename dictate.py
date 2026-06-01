@@ -40,7 +40,22 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE, ".env"))
 
 SR = 16000
-HOTKEY = keyboard.Key.f9
+
+
+def _resolve_hotkey(name):
+    """Converte o nome da tecla (vindo do .env) num objeto de tecla do pynput.
+    Recomendado: teclas de funcao (f1..f12). Letras atrapalham a digitacao."""
+    name = (name or "f9").strip().lower()
+    key = getattr(keyboard.Key, name, None)
+    if key is not None:
+        return key
+    if len(name) == 1:
+        return keyboard.KeyCode.from_char(name)
+    return keyboard.Key.f9
+
+
+HOTKEY = _resolve_hotkey(os.getenv("HOTKEY", "f9"))
+HOTKEY_LABEL = (os.getenv("HOTKEY", "f9")).strip().upper()
 MIN_DURATION = 0.3
 LANGUAGE = "pt"
 # Modelo de transcricao. Default whisper-1 (acesso garantido em qualquer projeto).
@@ -461,7 +476,7 @@ def main():
 
     # icone na bandeja (cara de programa instalado + botao Sair)
     tray = QSystemTrayIcon(QIcon(ICON_PATH), app)
-    tray.setToolTip("whisper-voice — segura F9 pra ditar")
+    tray.setToolTip(f"whisper-voice — segura {HOTKEY_LABEL} pra ditar")
     menu = QMenu()
     act_quit = QAction("Sair", app)
     act_quit.triggered.connect(app.quit)
@@ -485,7 +500,7 @@ def main():
     # recupera audios que ficaram pendentes de uma queda anterior (em background)
     threading.Thread(target=recover_pending, daemon=True).start()
 
-    log("whisper-voice pronto. Segura F9, fala, solta.")
+    log(f"whisper-voice pronto. Segura {HOTKEY_LABEL}, fala, solta.")
     sys.exit(app.exec_())
 
 
