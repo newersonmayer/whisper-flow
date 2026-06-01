@@ -76,9 +76,9 @@ já com a chave). Pronto.
   Erros inesperados são gravados com traceback no `dictate.log`.
 - **Histórico:** toda transcrição vai pra `transcricoes/AAAA-MM-DD.md`. O visualizador
   é o `historico.py` (tema dark, busca e botão copiar).
-- **Modelo:** configurável pelo `.env` (`WHISPER_MODEL`). Padrão `whisper-1`.
-  `gpt-4o-mini-transcribe` / `gpt-4o-transcribe` são mais precisos, mas exigem
-  liberar acesso ao modelo no projeto da OpenAI.
+- **Modelo:** configurável pelo `.env` (`WHISPER_MODEL`). Vem com
+  `gpt-4o-mini-transcribe` (mais preciso que o whisper-1). Se a chave não tiver
+  acesso a ele (erro 403), troque por `whisper-1` no `.env`.
 
 ## Arquivos
 
