@@ -25,8 +25,19 @@ Quando terminar, **feche e abra o Prompt de novo** (pra ele reconhecer o Python)
 
 ### 2. Baixe estes arquivos
 
-No GitHub, clique no botão verde **Code** → **Download ZIP**. Descompacte numa
-pasta fixa — por exemplo `C:\Ditador-de-Voz`. **Não rode de dentro do .zip.**
+**Opção A — `git clone` (recomendada se você usa Claude Code):** permite atualizar
+depois com um comando. No Prompt, dentro de uma pasta fixa:
+
+```
+git clone https://github.com/newersonmayer/whisper-flow.git
+```
+
+(se não tiver git: rode `winget install Git.Git`, feche e abra o Prompt)
+
+**Opção B — Download ZIP (mais simples):** no GitHub, **Code → Download ZIP**,
+descompacte numa pasta fixa. As atualizações depois serão manuais.
+
+Não rode de dentro do .zip.
 
 ### 3. Rode o instalador
 
@@ -77,6 +88,14 @@ Se você **clonou com git** (`git clone`): na pasta do projeto, rode
 
 Se você **baixou o ZIP**: baixe o ZIP novo, substitua os arquivos na pasta
 (mantendo o seu `.env`) e rode `instalar.bat` de novo.
+
+## Para quem usa Claude Code (atualizar por chat)
+
+Se instalou via `git clone`, o `instalar.bat` gera o arquivo
+**`INSTRUCAO-CLAUDE-CODE.md`** com o caminho da sua instalação já preenchido.
+Cole o conteúdo dele no `CLAUDE.md` do seu projeto do Claude Code. Depois é só
+dizer **"atualize o whisper"** no chat — ele navega até a pasta, puxa a atualização
+do repositório, reinstala o que precisar e reinicia o programa. Seu `.env` é preservado.
 
 ---
 

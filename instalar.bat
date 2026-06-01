@@ -53,6 +53,9 @@ echo   Sobe sozinho toda vez que ligar o PC.
 echo.
 echo   Se ainda nao colou a chave no .env: cole agora
 echo   e rode parar.bat e depois instalar.bat de novo.
+echo.
+echo   Usa Claude Code? Cole o conteudo de INSTRUCAO-CLAUDE-CODE.md
+echo   no CLAUDE.md do seu projeto pra atualizar dizendo "atualize o whisper".
 echo ============================================
 echo.
 pause

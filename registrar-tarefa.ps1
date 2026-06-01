@@ -46,5 +46,24 @@ Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" 
 Start-Sleep -Seconds 2
 Start-ScheduledTask -TaskName $taskName
 
+# gera o trecho pronto pra colar no CLAUDE.md de quem usa Claude Code (com o caminho real)
+$tpl = @'
+## Ditador de voz (whisper) - auto-update
+
+Esta ferramenta esta instalada em: `__DIR__`
+Repo: https://github.com/newersonmayer/whisper-flow (branch main, remote origin)
+
+Quando o usuario disser "atualize o whisper" / "atualiza o ditador de voz":
+1. Navegue ate a pasta `__DIR__`.
+2. Rode `git fetch` e compare `main` com `origin/main`. Se ja estiver atualizado, avise e pare.
+3. Rode `git pull`.
+4. Se `requirements.txt` mudou no pull, rode `venv\Scripts\python.exe -m pip install -r requirements.txt`.
+5. Reinicie pra carregar o codigo novo: encerre o `pythonw.exe` cujo command line contem `dictate.py` (a Tarefa Agendada "Ditador de Voz" religa sozinha em ~1 min) ou rode `Restart-ScheduledTask -TaskName "Ditador de Voz"`.
+6. Confirme a linha "pronto" no fim de `dictate.log`.
+Nunca edite nem versione o `.env` (contem a chave da API).
+'@
+$snippet = $tpl.Replace('__DIR__', $dir)
+Set-Content -Path (Join-Path $dir "INSTRUCAO-CLAUDE-CODE.md") -Value $snippet -Encoding UTF8
+
 Write-Host "Tarefa '$taskName' registrada e iniciada. Pode fechar esta janela."
 Start-Sleep -Seconds 3

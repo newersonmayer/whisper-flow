@@ -16,3 +16,6 @@ pendentes/
 # artefatos temporarios
 _test_*
 _inv_*
+
+# gerado pelo instalador (contem o caminho local da instalacao)
+INSTRUCAO-CLAUDE-CODE.md
