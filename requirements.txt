@@ -1,0 +1,10 @@
+numpy==2.4.6
+sounddevice==0.5.5
+soundfile==0.13.1
+pyperclip==1.11.0
+python-dotenv==1.2.2
+pynput==1.8.2
+openai==2.38.0
+comtypes==1.4.16
+pycaw==20251023
+PyQt5==5.15.11

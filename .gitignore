@@ -1,0 +1,18 @@
+# NUNCA versionar segredos nem dados pessoais
+.env
+
+# ambiente virtual (recriado pelo instalar.bat)
+venv/
+
+# caches Python
+__pycache__/
+*.pyc
+
+# logs e dados gerados em runtime (conteudo pessoal)
+*.log
+transcricoes/
+pendentes/
+
+# artefatos temporarios
+_test_*
+_inv_*
