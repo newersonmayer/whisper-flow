@@ -1,0 +1,2 @@
+Contexto: ditado de trabalho em português (Brasil), com termos técnicos de tecnologia em inglês.
+Termos frequentes: Claude, Claude Code, CLAUDE.md, Anthropic, OpenAI, whisper, API, MCP, deploy, commit, push, pull request, branch, merge, frontend, backend, webhook, endpoint, dashboard, sprint, Monday.

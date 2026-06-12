@@ -32,6 +32,10 @@ if not exist ".env" (
   echo.
 )
 
+REM --- 2b. Vocabulario pessoal a partir do exemplo (se ainda nao existir) ---
+REM         (termos que a transcricao costuma errar; edite pela aba Vocabulario)
+if not exist "vocabulario.txt" copy "vocabulario.example.txt" "vocabulario.txt" >nul
+
 REM --- 3. Ambiente virtual + dependencias ---
 echo Criando ambiente e instalando dependencias (pode demorar alguns minutos)...
 %PY% -m venv venv

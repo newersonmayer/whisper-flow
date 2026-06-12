@@ -1,6 +1,7 @@
 # Registra o Ditador de Voz como Tarefa Agendada do Windows:
-# - sobe sozinho no login
-# - reinicia sozinho se o processo cair (o Windows monitora; sem polling)
+# - sobe sozinho no login (roda o supervisor.py, que por sua vez roda o dictate.py)
+# - o supervisor relanca o dictate em ~2s se ele cair (inclusive crash nativo, que
+#   o "restart on failure" do Agendador nao pegava de forma confiavel)
 # Criar tarefa exige admin: se nao estiver elevado, pede UAC automaticamente.
 $ErrorActionPreference = "Stop"
 
@@ -13,7 +14,7 @@ if (-not $isAdmin) {
 
 $dir      = Split-Path -Parent $MyInvocation.MyCommand.Path
 $pyw      = Join-Path $dir "venv\Scripts\pythonw.exe"
-$script   = Join-Path $dir "dictate.py"
+$script   = Join-Path $dir "supervisor.py"   # o supervisor cuida de subir/relancar o dictate.py
 $taskName = "Ditador de Voz"
 
 if (-not (Test-Path $pyw)) {
@@ -39,28 +40,65 @@ Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
 $old = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs\Startup\Ditador de Voz.lnk"
 if (Test-Path $old) { Remove-Item $old -Force }
 
-# encerra qualquer instancia manual e deixa a tarefa subir a versao gerenciada
+# encerra qualquer instancia manual (supervisor e dictate) e deixa a tarefa subir a versao gerenciada
 Get-CimInstance Win32_Process -Filter "Name='pythonw.exe' OR Name='python.exe'" |
-    Where-Object { $_.CommandLine -like '*dictate.py*' } |
+    Where-Object { $_.CommandLine -like '*dictate.py*' -or $_.CommandLine -like '*supervisor.py*' } |
     ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
 Start-Sleep -Seconds 2
 Start-ScheduledTask -TaskName $taskName
 
+# atalho "Transcricoes" no Menu Iniciar e no Desktop (historico + gravacao livre + vocabulario)
+$hist = Join-Path $dir "historico.py"
+$ico  = Join-Path $dir "assets\mic.ico"
+$ws   = New-Object -ComObject WScript.Shell
+foreach ($lnkDir in @([Environment]::GetFolderPath('Programs'), [Environment]::GetFolderPath('Desktop'))) {
+    $lnk = $ws.CreateShortcut((Join-Path $lnkDir "Transcricoes.lnk"))
+    $lnk.TargetPath       = $pyw
+    $lnk.Arguments        = ('"{0}"' -f $hist)
+    $lnk.WorkingDirectory = $dir
+    $lnk.IconLocation     = $ico
+    $lnk.Description      = "Transcricoes do ditador de voz (historico, gravacao livre e vocabulario)"
+    $lnk.Save()
+}
+
+# o app sobe residente (escondido) no login: abrir frio levava ~25-30s entre
+# antivirus e disco; residente, "abrir" e so mostrar a janela (instantaneo)
+$startup = Join-Path ([Environment]::GetFolderPath('Startup')) "Transcricoes (segundo plano).lnk"
+$lnk = $ws.CreateShortcut($startup)
+$lnk.TargetPath       = $pyw
+$lnk.Arguments        = ('"{0}" --hidden' -f $hist)
+$lnk.WorkingDirectory = $dir
+$lnk.IconLocation     = $ico
+$lnk.Description      = "Mantem o app Transcricoes residente pra abrir na hora"
+$lnk.Save()
+
 # gera o trecho pronto pra colar no CLAUDE.md de quem usa Claude Code (com o caminho real)
 $tpl = @'
-## Ditador de voz (whisper) - auto-update
+## Ditador de voz (whisper-voice) - auto-update
 
 Esta ferramenta esta instalada em: `__DIR__`
 Repo: https://github.com/newersonmayer/whisper-flow (branch main, remote origin)
+Ela tem DOIS programas: o ditador (dictate.py, atalho de teclado global) e o app
+Transcricoes (historico.py, residente em segundo plano).
 
-Quando o usuario disser "atualize o whisper" / "atualiza o ditador de voz":
+Quando o usuario pedir pra atualizar essa ferramenta ("atualize o whisper",
+"atualiza a ferramenta de voz", "veja a ferramenta whisper voice e atualize"):
 1. Navegue ate a pasta `__DIR__`.
 2. Rode `git fetch` e compare `main` com `origin/main`. Se ja estiver atualizado, avise e pare.
 3. Rode `git pull`.
-4. Se `requirements.txt` mudou no pull, rode `venv\Scripts\python.exe -m pip install -r requirements.txt`.
-5. Reinicie pra carregar o codigo novo: encerre o `pythonw.exe` cujo command line contem `dictate.py` (a Tarefa Agendada "Ditador de Voz" religa sozinha em ~1 min) ou rode `Restart-ScheduledTask -TaskName "Ditador de Voz"`.
-6. Confirme a linha "pronto" no fim de `dictate.log`.
-Nunca edite nem versione o `.env` (contem a chave da API).
+4. Se `requirements.txt` mudou no pull: `venv\Scripts\python.exe -m pip install -r requirements.txt`.
+5. Se `instalar.bat` ou `registrar-tarefa.ps1` mudaram no pull: rode `instalar.bat`
+   de novo (recria tarefa agendada e atalhos; pede UAC - avise o usuario antes).
+6. Reinicie os dois programas:
+   - encerre os `pythonw.exe` cujo command line contem `dictate.py` (o supervisor religa em ~2s);
+   - encerre os `pythonw.exe` cujo command line contem `historico.py` e relance:
+     `venv\Scripts\pythonw.exe historico.py --hidden`
+   - cada programa aparece como DOIS processos (launcher do venv + Python real) - encerre todos do filtro.
+7. Confirme a linha "whisper-voice pronto" no fim de `dictate.log`.
+
+PRESERVAR SEMPRE (gitignored - nunca editar, versionar, sobrescrever ou recriar):
+`.env` (chave da API + HOTKEY com a tecla preferida do usuario + modelo),
+`vocabulario.txt` (vocabulario pessoal), `transcricoes/`, `audios/`, `*.log`.
 '@
 $snippet = $tpl.Replace('__DIR__', $dir)
 Set-Content -Path (Join-Path $dir "INSTRUCAO-CLAUDE-CODE.md") -Value $snippet -Encoding UTF8

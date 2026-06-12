@@ -12,6 +12,10 @@ __pycache__/
 *.log
 transcricoes/
 pendentes/
+audios/
+
+# vocabulario pessoal (cada maquina tem o seu; editavel pela aba Vocabulario)
+vocabulario.txt
 
 # artefatos temporarios
 _test_*
