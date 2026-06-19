@@ -16,6 +16,7 @@ import math
 import time
 import shutil
 import socket
+import subprocess
 import threading
 import datetime
 import traceback
@@ -153,33 +154,63 @@ def _beep(freq, ms):
 
 
 _muted_by_us = False
+_prev_mute = "0"           # estado do mute ANTES de mutarmos (preserva mute manual)
+_audio_lock = threading.Lock()
+SETMUTE = os.path.join(BASE, "setmute.py")
+# Interpretador do subprocesso de mute: o pythonw do venv (que tem pycaw),
+# nao sys.executable — o dictate.py as vezes roda pelo Python global, que pode
+# nao ter pycaw instalado. Fallback pro interpretador atual se o venv sumir.
+_VENV_PY = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
+MUTE_PY = _VENV_PY if os.path.exists(_VENV_PY) else sys.executable
+
+
+def _setmute(action):
+    """Roda o SetMute (pycaw/COM) num subprocesso Python isolado — ver setmute.py.
+    Isola o processo principal dos crashes nativos (0xC0000005) que o COM
+    in-process causava, e NAO dispara o OSD de volume do Windows (a tecla de
+    midia disparava, atrapalhando enxergar o overlay). Retorna o stdout
+    (estado anterior, no caso de 'mute')."""
+    try:
+        r = subprocess.run(
+            [MUTE_PY, SETMUTE, action],
+            capture_output=True, text=True, timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if r.returncode != 0:
+            log(f"setmute {action} returncode={r.returncode}: {r.stderr.strip()}")
+        return r.stdout.strip()
+    except Exception as e:
+        log(f"setmute {action} falhou: {e}")
+        return ""
+
+
+def _apply_mute(action):
+    # Serializado: o unmute (stop) so roda depois do mute (start) terminar, mesmo
+    # com spawn assincrono — evita race em ditado curto.
+    global _prev_mute
+    with _audio_lock:
+        if action == "mute":
+            _prev_mute = _setmute("mute")
+        elif _prev_mute != "1":      # so desmuta se NAO ja estava mutado pelo usuario
+            _setmute("unmute")
 
 
 def mute_system():
-    # Muta pela tecla de midia do Windows (pynput -> SendInput), NAO pela API COM
-    # IAudioEndpointVolume (pycaw). Aquele caminho COM era a causa dos crashes
-    # nativos recorrentes (_ctypes.pyd / 0xC0000005) e ainda deixava o controle
-    # de volume do Windows travado. A tecla de mute e um toggle, entao guardamos
-    # que fomos nos que mutamos pra desmutar certo no fim.
+    # Mute via subprocesso (pycaw/COM isolado) em thread daemon: nao bloqueia o
+    # caminho de gravacao e nao dispara o OSD do Windows.
     global _muted_by_us
     if not MUTE_WHILE_RECORDING or _muted_by_us:
         return
-    try:
-        kb.tap(keyboard.Key.media_volume_mute)
-        _muted_by_us = True
-    except Exception as e:
-        log(f"mute falhou: {e}")
+    _muted_by_us = True
+    threading.Thread(target=_apply_mute, args=("mute",), daemon=True).start()
 
 
 def unmute_system():
     global _muted_by_us
     if not MUTE_WHILE_RECORDING or not _muted_by_us:
         return
-    try:
-        kb.tap(keyboard.Key.media_volume_mute)
-    except Exception as e:
-        log(f"unmute falhou: {e}")
     _muted_by_us = False
+    threading.Thread(target=_apply_mute, args=("unmute",), daemon=True).start()
 
 
 def save_history(text, now=None):
