@@ -61,7 +61,8 @@ _KEY_ALIASES = {
 _LABELS = {
     "ctrl": "Ctrl", "ctrl_l": "Ctrl", "ctrl_r": "Ctrl direito", "control": "Ctrl",
     "win": "Win", "cmd": "Win", "super": "Win", "meta": "Win",
-    "cmd_l": "Win", "cmd_r": "Win direito", "alt": "Alt", "shift": "Shift",
+    "cmd_l": "Win", "cmd_r": "Win direito", "shift": "Shift",
+    "alt": "Alt", "alt_l": "Alt", "alt_r": "Alt direito", "alt_gr": "Alt Gr",
 }
 
 
@@ -79,18 +80,34 @@ def _resolve_token(name):
 
 
 def _resolve_hotkey(spec):
-    """Converte 'f9' ou 'ctrl_l+win' num combo: lista de conjuntos de teclas.
-    Dispara quando ao menos uma tecla de CADA conjunto esta pressionada.
-    Recomendado: tecla de funcao (f9) ou combo de modificadores (ctrl_l+win).
+    """Converte 'f9', 'ctrl_l+win' ou 'alt_gr/ctrl_r' num combo: lista de
+    conjuntos de teclas. Dispara quando ao menos uma tecla de CADA conjunto
+    esta pressionada.
+    - '+' = E (combo simultaneo): 'ctrl_l+win' exige as duas juntas.
+    - '/' = OU (alternativas): 'alt_gr/ctrl_r' aciona com qualquer uma das duas.
+    Recomendado: tecla de funcao (f9), combo de modificadores (ctrl_l+win) ou
+    alternativas (alt_gr/ctrl_r) pra teclados diferentes.
     Modificador sozinho (ctrl/alt) atrapalha atalhos - evite."""
     spec = (spec or "f9").strip().lower()
-    combo = [s for s in (_resolve_token(t) for t in spec.split("+") if t.strip()) if s]
+    combo = []
+    for part in spec.split("+"):
+        keys = set()
+        for alt in part.split("/"):
+            if alt.strip():
+                keys |= _resolve_token(alt)
+        if keys:
+            combo.append(keys)
     return combo or [{keyboard.Key.f9}]
 
 
 def _hotkey_label(spec):
     spec = (spec or "f9").strip().lower()
-    parts = [_LABELS.get(t.strip(), t.strip().upper()) for t in spec.split("+") if t.strip()]
+    parts = []
+    for part in spec.split("+"):
+        alts = [_LABELS.get(a.strip(), a.strip().upper())
+                for a in part.split("/") if a.strip()]
+        if alts:
+            parts.append(" ou ".join(alts))
     return " + ".join(parts) or "F9"
 
 
