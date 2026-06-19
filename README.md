@@ -8,8 +8,7 @@ sozinho toda vez que o PC liga.
 
 Acompanha o app **Transcrições** (atalho no Menu Iniciar e no Desktop), com três abas:
 - **Gravar** — gravação livre por clique (pra ditar enquanto mexe na tela);
-- **Histórico** — tudo que foi transcrito, por dia, com busca, **Copiar**, **Ouvir**
-  o áudio original (últimos 7 dias) e **Refazer** a transcrição;
+- **Histórico** — tudo que foi transcrito, por dia, com busca e **Copiar**;
 - **Vocabulário** — termos que a transcrição costuma errar (nomes, siglas, jargão).
   Salvou, valeu na próxima gravação — sem reiniciar nada.
 
@@ -83,10 +82,6 @@ Se a transcrição troca termos seus (ex: "CLAUDE.md" virando "cloud.md"), abra 
 app **Transcrições → aba Vocabulário**, liste os nomes/siglas/jargões do seu dia a
 dia e clique **Salvar**. Esse texto vira contexto pra API em toda gravação — a
 próxima já sai certa, sem reinstalar nem reiniciar nada.
-
-Dá até pra corrigir o passado: na aba **Histórico**, os itens dos últimos 7 dias
-guardam o áudio original — clique **Refazer** pra re-transcrever com o vocabulário
-atual (e **Ouvir** pra conferir o que foi dito).
 
 ## Como fechar
 
@@ -183,8 +178,8 @@ e seu vocabulário**.
   momento em que você **começa** a gravar (esquenta enquanto fala). Linhas `[t]` no
   `dictate.log` medem tecla→overlay, encode e tempo de API.
 - **Histórico:** toda transcrição vai pra `transcricoes/AAAA-MM-DD.md` (texto, pra
-  sempre). O áudio fica em `audios/AAAA-MM-DD/HHMMSS.wav` por **7 dias** (rolling) —
-  é o que alimenta o Ouvir/Refazer do app `historico.py`.
+  sempre). O áudio original fica guardado em `audios/AAAA-MM-DD/HHMMSS.wav` por
+  **7 dias** (rolling), como backup pra conferência manual.
 - **Vocabulário:** `vocabulario.txt` (criado a partir do `vocabulario.example.txt`)
   é enviado como `prompt` da API em toda transcrição — nos modelos `gpt-4o-*-transcribe`
   ele vale inteiro como contexto; no `whisper-1` só os últimos 224 tokens contam.

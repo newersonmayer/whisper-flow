@@ -3,9 +3,7 @@ Transcrições — app do whisper-voice (QFluentWidgets, tema dark quase-preto,
 sidebar de navegação estilo Fluent/WinUI), com três telas:
 
   • Histórico    — transcrições salvas (transcricoes/*.md) agrupadas por dia,
-                   com busca, Copiar, Ouvir (áudio dos últimos dias fica em
-                   audios/) e Refazer (re-transcreve o áudio com o vocabulário
-                   atual e atualiza o texto salvo). Card de estatísticas ao lado.
+                   com busca e Copiar. Card de estatísticas ao lado.
   • Gravar       — gravação LIVRE: clica pra começar, fala e mexe na tela à
                    vontade (sem segurar tecla nenhuma), clica de novo pra parar.
                    Transcreve, mostra o texto, copia pro clipboard e salva.
@@ -24,7 +22,6 @@ import time
 import socket
 import threading
 import datetime
-import winsound
 from collections import deque
 
 GUARD_PORT = 49734   # instancia unica (dictate usa 49732, supervisor 49733)
@@ -59,7 +56,6 @@ from qfluentwidgets import (
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 HIST_DIR = os.path.join(BASE, "transcricoes")
-AUDIO_DIR = os.path.join(BASE, "audios")
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")
 VOCAB_EXAMPLE = os.path.join(BASE, "vocabulario.example.txt")
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
@@ -134,24 +130,7 @@ QSS = f"""
 # ---------------- dados ----------------
 
 def load_entries(limit=300):
-    """Histórico mais recente primeiro: [{day, ts, text, audio, dur}].
-    O áudio é casado por um índice montado UMA vez (1 listdir por dia),
-    em vez de um glob por entrada. Duração fica None (calculada ao Ouvir)."""
-    audio_idx = {}
-    for d in glob.glob(os.path.join(AUDIO_DIR, "*")):
-        if os.path.isdir(d):
-            try:
-                audio_idx[os.path.basename(d)] = sorted(os.listdir(d))
-            except OSError:
-                pass
-
-    def audio_of(day, ts):
-        prefix = ts.replace(":", "")
-        for f in audio_idx.get(day, ()):
-            if f.startswith(prefix) and f.endswith(".wav"):
-                return os.path.join(AUDIO_DIR, day, f)
-        return None
-
+    """Histórico mais recente primeiro: [{day, ts, text}]."""
     entries = []
     for fp in sorted(glob.glob(os.path.join(HIST_DIR, "*.md")), reverse=True):
         day = os.path.splitext(os.path.basename(fp))[0]
@@ -162,19 +141,10 @@ def load_entries(limit=300):
         for ln in reversed(lines):
             m = LINE_RE.match(ln.strip())
             if m:
-                entries.append({"day": day, "ts": m.group(1), "text": m.group(2),
-                                "audio": audio_of(day, m.group(1)), "dur": None})
+                entries.append({"day": day, "ts": m.group(1), "text": m.group(2)})
                 if len(entries) >= limit:
                     return entries
     return entries
-
-
-def audio_duration(path):
-    try:
-        import soundfile as sf
-        return sf.info(path).duration
-    except Exception:
-        return None
 
 
 def day_label(day):
@@ -228,23 +198,6 @@ def save_history(text):
     oneline = " ".join(text.split())
     with open(os.path.join(HIST_DIR, f"{now:%Y-%m-%d}.md"), "a", encoding="utf-8") as f:
         f.write(f"- **{now:%H:%M:%S}** — {oneline}\n")
-
-
-def update_history_line(day, ts, old_text, new_text):
-    """Troca o texto de um item no md do dia (usado pelo Refazer)."""
-    fp = os.path.join(HIST_DIR, f"{day}.md")
-    try:
-        lines = open(fp, encoding="utf-8").read().splitlines()
-    except Exception:
-        return False
-    target = f"- **{ts}** — {old_text}"
-    for i, ln in enumerate(lines):
-        if ln.strip() == target:
-            lines[i] = f"- **{ts}** — {' '.join(new_text.split())}"
-            with open(fp, "w", encoding="utf-8") as f:
-                f.write("\n".join(lines) + "\n")
-            return True
-    return False
 
 
 def read_vocab():
@@ -525,22 +478,14 @@ class RecordPanel(QWidget):
         self.status.setText(f"Gravando…  {time.time() - self._rec_start:0.1f}s")
 
 
-class RedoBridge(QObject):
-    done = pyqtSignal(object)   # {entry, body, btn, text, err}
-
-
 class HistPanel(QWidget):
     """Tela Histórico — lista por dia (hora à esquerda, divisórias finas),
-    busca, Copiar / Ouvir / Refazer, e card de estatísticas ao lado."""
+    busca, Copiar, e card de estatísticas ao lado."""
 
     def __init__(self):
         super().__init__()
         self.setObjectName("histPage")
         self.setStyleSheet(QSS)
-        self._play_btn = None
-        self._play_token = 0
-        self.redo_bridge = RedoBridge()
-        self.redo_bridge.done.connect(self._on_redone)
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(28, 24, 28, 24)
@@ -624,7 +569,6 @@ class HistPanel(QWidget):
         self.render()
 
     def reload(self):
-        self._stop_playback()
         self.entries = load_entries()
         self._loading = False
         self._cap = 120
@@ -717,28 +661,10 @@ class HistPanel(QWidget):
         body.setTextInteractionFlags(Qt.TextSelectableByMouse)
         h.addWidget(body, 1)
 
-        acts = QHBoxLayout()
-        acts.setSpacing(2)
-        if e["audio"]:
-            play = TransparentPushButton(FluentIcon.PLAY, "Ouvir")
-            play.setCursor(Qt.PointingHandCursor)
-            play.clicked.connect(lambda _, e=e, b=play: self._toggle_play(e, b))
-            acts.addWidget(play)
-
-            redo = TransparentPushButton(FluentIcon.SYNC, "Refazer")
-            redo.setCursor(Qt.PointingHandCursor)
-            redo.setToolTip("Re-transcreve o áudio com o vocabulário atual e atualiza o texto salvo.")
-            redo.clicked.connect(lambda _, e=e, b=body, btn=redo: self._retranscribe(e, b, btn))
-            acts.addWidget(redo)
-
         copy = TransparentPushButton(FluentIcon.COPY, "Copiar")
         copy.setCursor(Qt.PointingHandCursor)
         copy.clicked.connect(lambda _, e=e, b=copy: self._copy(e, b))
-        acts.addWidget(copy)
-
-        actw = QWidget()
-        actw.setLayout(acts)
-        h.addWidget(actw, 0, Qt.AlignTop)
+        h.addWidget(copy, 0, Qt.AlignTop)
         return row
 
     # ---- copiar ----
@@ -759,79 +685,6 @@ class HistPanel(QWidget):
             except RuntimeError:
                 pass
         QTimer.singleShot(ms, reset)
-
-    # ---- ouvir ----
-    def _toggle_play(self, e, btn):
-        if self._play_btn is btn:
-            self._stop_playback()
-            return
-        self._stop_playback()
-        try:
-            winsound.PlaySound(e["audio"], winsound.SND_FILENAME | winsound.SND_ASYNC)
-        except Exception:
-            self._flash(btn, "Erro no áudio", "Ouvir", ms=1600)
-            return
-        self._play_btn = btn
-        self._play_token += 1
-        tok = self._play_token
-        btn.setText("Parar")
-        if e["dur"] is None:
-            e["dur"] = audio_duration(e["audio"])   # preguicoso: so de quem toca
-        if e["dur"]:
-            QTimer.singleShot(int(e["dur"] * 1000) + 300, lambda: self._auto_stop(tok))
-
-    def _auto_stop(self, tok):
-        if tok == self._play_token and self._play_btn is not None:
-            self._stop_playback()
-
-    def _stop_playback(self):
-        try:
-            winsound.PlaySound(None, winsound.SND_PURGE)
-        except Exception:
-            pass
-        btn, self._play_btn = self._play_btn, None
-        self._play_token += 1
-        if btn is not None:
-            try:
-                btn.setText("Ouvir")
-            except RuntimeError:
-                pass   # lista foi re-renderizada enquanto tocava
-
-    # ---- refazer (re-transcrever com o vocabulário atual) ----
-    def _retranscribe(self, e, body, btn):
-        btn.setEnabled(False)
-        btn.setText("Transcrevendo…")
-
-        def run():
-            try:
-                import soundfile as sf
-                data, sr = sf.read(e["audio"], dtype="int16")
-                text, err = transcribe(data, sr)
-            except Exception as ex:
-                text, err = "", str(ex)[:140]
-            self.redo_bridge.done.emit(
-                {"entry": e, "body": body, "btn": btn, "text": text, "err": err})
-        threading.Thread(target=run, daemon=True).start()
-
-    def _on_redone(self, d):
-        e, btn = d["entry"], d["btn"]
-        if d["err"] or not d["text"]:
-            self._flash(btn, "Falhou", "Refazer", ms=1800)
-            return
-        new = " ".join(d["text"].split())
-        if new == e["text"]:
-            self._flash(btn, "Saiu igual", "Refazer", ms=1600)
-            return
-        if not update_history_line(e["day"], e["ts"], e["text"], new):
-            self._flash(btn, "Não achei no arquivo", "Refazer", ms=2000)
-            return
-        e["text"] = new
-        try:
-            d["body"].setText(new)
-        except RuntimeError:
-            pass
-        self._flash(btn, "Atualizado ✓", "Refazer", ms=1600)
-
 
 class VocabPanel(QWidget):
     """Tela Vocabulário — o prompt que a API recebe em toda transcrição."""
