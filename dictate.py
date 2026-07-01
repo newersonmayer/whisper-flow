@@ -32,7 +32,7 @@ from pynput import keyboard
 from openai import OpenAI
 
 from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer
-from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon
+from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon, QCursor
 from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -358,9 +358,19 @@ class Overlay(QWidget):
         self.update()
 
     def reposition(self):
-        scr = QApplication.primaryScreen().availableGeometry()
+        # Fica no monitor onde o cursor esta (setup multi-monitor): o overlay
+        # segue a tela ATIVA em vez de ficar preso na primaria. Antes, ancorado
+        # em primaryScreen(), ele (a) aparecia na tela errada quando o foco
+        # estava em outro monitor e (b) apos hot-plug de monitor o Qt do processo
+        # ja rodando reportava geometria stale da primaria e a pill caia fora da
+        # area visivel (ex: y=1822 abaixo da borda do primario -> sumia).
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        scr = screen.availableGeometry()
         x = scr.x() + (scr.width() - self.width()) // 2
         y = scr.y() + scr.height() - self.height() - 14
+        # clamp defensivo: a pill nunca sai da area visivel da tela escolhida
+        x = max(scr.x(), min(x, scr.x() + scr.width() - self.width()))
+        y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
         self.move(x, y)
 
     def show_recording(self):
