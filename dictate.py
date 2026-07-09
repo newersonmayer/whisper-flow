@@ -10,6 +10,7 @@ Mostra o tempo da transcricao ao terminar. Icone na bandeja com "Sair".
 """
 import os
 import io
+import re
 import sys
 import glob
 import math
@@ -540,10 +541,37 @@ def slot_stop():
     threading.Thread(target=worker, args=(frames,), daemon=True).start()
 
 
+def _norm_for_echo(s):
+    """Normaliza pra comparar eco: minusculas, sem pontuacao, espaco colapsado."""
+    return " ".join(re.sub(r"[^\w\s]", " ", s.lower()).split())
+
+
+def _looks_like_vocab_echo(text, vocab):
+    """True quando a transcricao e, na verdade, um trecho do vocabulario e nao
+    a fala. O whisper-1 opera como GPT base e imita o estilo do prompt: com o
+    vocabulario (uma lista de termos) as vezes 'cai na lista' e ecoa termos do
+    prompt em vez de transcrever (investigacao jul/2026 — ~25% dos ditados). A
+    fala em si e decodificavel; so a saida com prompt sai errada.
+    Deteccao: a saida (3+ palavras) e uma SUBSEQUENCIA ordenada do vocabulario —
+    toda palavra dela aparece no vocab, na mesma ordem (o modelo as vezes pula
+    termos, entao 'contido' exato nao basta). Fala real tem palavras funcionais
+    (de, que, nao, ta...) fora do vocab, logo nao casa. gpt-4o-transcribe nao
+    faz isso, mas o guard protege se o modelo voltar pro whisper-1."""
+    t = _norm_for_echo(text).split()
+    if len(t) < 3:
+        return False
+    i = 0
+    for w in _norm_for_echo(vocab).split():
+        if i < len(t) and t[i] == w:
+            i += 1
+    return i == len(t)
+
+
 def transcribe_bytes(bio):
     """Transcreve um buffer WAV (BytesIO). Retorna (texto, erro)."""
     err = None
-    kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"), language=LANGUAGE)
+    base_kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"), language=LANGUAGE)
+    kwargs = dict(base_kwargs)
     vocab = read_vocab()
     if vocab:
         # contexto pro modelo acertar termos do dia a dia ("CLAUDE.md", nao
@@ -554,7 +582,16 @@ def transcribe_bytes(bio):
         try:
             bio.seek(0)
             r = client.audio.transcriptions.create(**kwargs)
-            return (r.text or "").strip(), None
+            text = (r.text or "").strip()
+            # guard anti-eco: se a saida for um trecho do vocabulario, o modelo
+            # ecoou o prompt em vez de transcrever. Refaz sem prompt — a fala e
+            # decodificavel, so o prompt sabotou (ver _looks_like_vocab_echo).
+            if vocab and text and _looks_like_vocab_echo(text, vocab):
+                log("saida parece eco do vocabulario; refazendo sem prompt")
+                bio.seek(0)
+                r = client.audio.transcriptions.create(**base_kwargs)
+                text = (r.text or "").strip()
+            return text, None
         except Exception as e:
             err = str(e)[:90]
             log(f"api tentativa {attempt + 1} falhou: {err}")
