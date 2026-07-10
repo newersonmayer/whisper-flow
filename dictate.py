@@ -19,6 +19,7 @@ import shutil
 import socket
 import subprocess
 import threading
+import ctypes
 import datetime
 import traceback
 from collections import deque
@@ -34,7 +35,9 @@ from openai import OpenAI
 
 from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon, QCursor
-from PyQt5.QtWidgets import QApplication, QWidget, QSystemTrayIcon, QMenu, QAction
+from PyQt5.QtWidgets import (
+    QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QPushButton,
+)
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE, ".env"))
@@ -64,6 +67,7 @@ _LABELS = {
     "win": "Win", "cmd": "Win", "super": "Win", "meta": "Win",
     "cmd_l": "Win", "cmd_r": "Win direito", "shift": "Shift",
     "alt": "Alt", "alt_l": "Alt", "alt_r": "Alt direito", "alt_gr": "Alt Gr",
+    "space": "Espaço",
 }
 
 
@@ -115,6 +119,12 @@ def _hotkey_label(spec):
 _HOTKEY_SPEC = os.getenv("HOTKEY", "f9")
 HOTKEY = _resolve_hotkey(_HOTKEY_SPEC)
 HOTKEY_LABEL = _hotkey_label(_HOTKEY_SPEC)
+# Atalho do modo maos-livres (toggle: aperta uma vez, grava sem segurar; aperta
+# de novo ou clica Parar pra parar). Teclas nomeadas evitam ambiguidade de letra
+# sob modificador no pynput; ctrl+alt+space nao colide com atalho do Windows.
+_HANDSFREE_SPEC = os.getenv("HOTKEY_HANDSFREE", "ctrl+alt+space")
+HANDSFREE_HOTKEY = _resolve_hotkey(_HANDSFREE_SPEC)
+HANDSFREE_LABEL = _hotkey_label(_HANDSFREE_SPEC)
 MIN_DURATION = 0.3
 LANGUAGE = "pt"
 # Modelo de transcricao. Default whisper-1 (acesso garantido em qualquer projeto).
@@ -140,6 +150,7 @@ kb = keyboard.Controller()
 
 bridge = None
 overlay = None
+hf_window = None
 
 _frames = []
 _stream = None
@@ -148,6 +159,9 @@ _last_level = 0.0
 _state_lock = threading.Lock()
 _pressed = set()   # teclas atualmente pressionadas (so a thread do listener mexe)
 _t_press = None    # perf_counter do apertar da tecla -> mede tecla->overlay
+_rec_mode = None   # None | "hold" | "handsfree" — quem esta gravando agora
+_handsfree_combo_active = False  # True enquanto o chord maos-livres esta 100% pressionado (anti-repeat)
+_hf_target_hwnd = None           # janela em foco quando o atalho maos-livres foi apertado (pro auto-paste)
 
 
 def log(msg):
@@ -319,6 +333,9 @@ class Bridge(QObject):
     start = pyqtSignal()
     stop = pyqtSignal()
     done = pyqtSignal(float)   # segundos da transcricao; <0 = sem texto/erro
+    handsfree_toggle = pyqtSignal()   # aperto do atalho maos-livres OU clique no Parar
+    handsfree_cancel = pyqtSignal()   # ESC: descarta sem transcrever
+    handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
 
 
 class Overlay(QWidget):
@@ -492,17 +509,200 @@ class Overlay(QWidget):
                    Qt.AlignVCenter | Qt.AlignRight, txt)
 
 
-def slot_start():
+class HandsFreeWindow(QWidget):
+    """Pill do modo maos-livres: mesmo visual preto do Overlay, mas com um botao
+    Parar clicavel. Nao rouba foco (WS_EX_NOACTIVATE via WindowDoesNotAcceptFocus
+    + WA_ShowWithoutActivating) — recebe clique de mouse sem ativar, o que faz o
+    auto-paste cair na janela de tras, nao nela. Estados: rec (onda+timer+Parar),
+    busy (transcrevendo), done ("colado") e fail (erro). Parar e a hotkey de novo
+    fazem a mesma coisa (toggle), ambos via bridge.handsfree_toggle."""
+
+    W, H = 300, 48
+    BTN_W = 74
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFixedSize(self.W, self.H)
+        self.mode = "rec"
+        self.msg = ""
+        self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
+        self.rec_start = 0.0
+
+        self.btn = QPushButton("■  Parar", self)
+        self.btn.setCursor(Qt.PointingHandCursor)
+        self.btn.setFocusPolicy(Qt.NoFocus)   # nunca segura foco de teclado
+        self.btn.setStyleSheet(
+            "QPushButton { color: #E8E8EC; background: rgba(235,70,70,40);"
+            " border: 1px solid rgba(235,70,70,120); border-radius: 12px;"
+            " font: 600 10pt 'Segoe UI'; padding: 0 4px; }"
+            "QPushButton:hover { background: rgba(235,70,70,90); }"
+        )
+        self.btn.setGeometry(self.W - self.BTN_W - 10, 11, self.BTN_W, self.H - 22)
+        self.btn.clicked.connect(lambda: bridge.handsfree_toggle.emit())
+
+        self._repaint = QTimer(self)
+        self._repaint.setInterval(33)
+        self._repaint.timeout.connect(self._tick)
+
+    def _tick(self):
+        if self.mode == "rec":
+            self.levels.append(_last_level)
+        self.update()
+
+    def reposition(self):
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        scr = screen.availableGeometry()
+        x = scr.x() + (scr.width() - self.width()) // 2
+        y = scr.y() + scr.height() - self.height() - 14
+        x = max(scr.x(), min(x, scr.x() + scr.width() - self.width()))
+        y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
+        self.move(x, y)
+
+    def show_recording(self):
+        self.mode = "rec"
+        self.rec_start = time.time()
+        self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
+        self.btn.setText("■  Parar")
+        self.btn.show()
+        self.reposition()
+        self.show()
+        self.raise_()
+        self._repaint.start()
+        self.update()
+
+    def show_busy(self):
+        self.mode = "busy"
+        self.btn.hide()   # transcrevendo: nao ha o que parar
+        self.update()
+
+    def show_done(self, secs):
+        if _recording and _rec_mode == "handsfree":
+            return   # uma nova gravacao maos-livres ja comecou
+        self.btn.hide()
+        if secs >= 0:
+            self._flash("done", f"colado · {secs:.1f}s", 900)
+        elif secs == -2.0:
+            self._flash("fail", "falhou — audio guardado pra retry", 1600)
+        elif secs == -3.0:
+            self._flash("fail", "nao entendi nada", 1200)
+        else:
+            self.hide_it()
+
+    def _flash(self, mode, msg, ms):
+        self.mode = mode
+        self.msg = msg
+        if not self.isVisible():
+            self.reposition()
+            self.show()
+            self.raise_()
+        if not self._repaint.isActive():
+            self._repaint.start()
+        self.update()
+        QTimer.singleShot(ms, lambda: self._end_flash(mode))
+
+    def _end_flash(self, mode):
+        if self.mode == mode and not (_recording and _rec_mode == "handsfree"):
+            self.hide_it()
+
+    def hide_it(self):
+        self._repaint.stop()
+        self.hide()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        cy = h / 2
+        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+        p.setBrush(QColor(6, 6, 7, 250))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
+
+        if self.mode == "busy":
+            ang = int((time.time() * 320) % 360)
+            pen = QPen(QColor("#A6A6AC"), 2.0)
+            pen.setCapStyle(Qt.RoundCap)
+            p.setPen(pen)
+            p.drawArc(QRect(18, int(cy - 7), 14, 14), -ang * 16, 110 * 16)
+            dots = "." * (int(time.time() * 2.5) % 4)
+            p.setPen(QColor("#C9C9CE"))
+            p.setFont(QFont("Segoe UI", 10))
+            p.drawText(QRect(42, 0, w - 54, h), Qt.AlignVCenter | Qt.AlignLeft,
+                       f"transcrevendo{dots}")
+            return
+        if self.mode in ("done", "fail"):
+            ok = self.mode == "done"
+            p.setPen(QColor("#D8D8DC") if ok else QColor("#F87171"))
+            p.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
+            mark = "✓  " if ok else "✕  "
+            p.drawText(self.rect(), Qt.AlignCenter, mark + self.msg)
+            return
+
+        # rec: ponto vermelho + onda + timer (a onda para antes do botao)
+        pulse = 0.5 + 0.5 * math.sin(time.time() * 3.5)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(235, 70, 70, int(130 + 125 * pulse)))
+        p.drawEllipse(15, int(cy - 4), 8, 8)
+
+        timer_w = 46
+        x0 = 32
+        area_w = w - x0 - timer_w - self.BTN_W - 22
+        spacing = area_w / (N_POINTS - 1)
+        amp = h * 0.30
+        pen = QPen(QColor("#9A9AA0"), 2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        for i, lvl in enumerate(self.levels):
+            ext = max(1.0, lvl * amp)
+            x = x0 + i * spacing
+            p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
+
+        e = time.time() - self.rec_start
+        txt = f"{int(e // 60)}:{int(e % 60):02d}" if e >= 60 else f"{e:0.1f}s"
+        p.setPen(QColor("#E3E3E7"))
+        p.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
+        p.drawText(QRect(x0 + int(area_w) + 4, 0, timer_w, h),
+                   Qt.AlignVCenter | Qt.AlignRight, txt)
+
+
+def _get_foreground():
+    """HWND da janela em foco agora (o alvo do auto-paste no modo maos-livres)."""
+    try:
+        return ctypes.windll.user32.GetForegroundWindow()
+    except Exception:
+        return None
+
+
+def _focus_and_paste(text, hwnd):
+    """Reforca o foco na janela-alvo e cola. Como a pill e NOACTIVATE, o alvo
+    normalmente JA e o foreground — o SetForegroundWindow e rede de seguranca
+    (ex: se eu troquei de janela no meio, cola na que estava no inicio)."""
+    try:
+        if hwnd:
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+            time.sleep(0.05)
+    except Exception as e:
+        log(f"set foreground falhou: {e}")
+    paste(text)
+
+
+def _begin_capture():
+    """Abre o stream, muta, warmup, beep. Seta _recording. Retorna False se ja
+    grava (miolo compartilhado entre hold-to-talk e maos-livres)."""
     global _recording, _stream, _frames, _last_level
     with _state_lock:
         if _recording:
-            return
+            return False
         _frames = []
         _recording = True
     _last_level = 0.0
-    overlay.show_recording()   # visual instantaneo, antes de abrir o audio (que pode demorar a frio)
-    if _t_press:
-        log(f"[t] tecla->overlay {(time.perf_counter() - _t_press) * 1000:.0f}ms")
     warmup_api(quiet=True)   # esquenta a conexao ENQUANTO o usuario fala
     beep(880)
 
@@ -517,14 +717,16 @@ def slot_start():
     )
     _stream.start()
     mute_system()
-    log("Gravando...")
+    return True
 
 
-def slot_stop():
+def _end_capture():
+    """Fecha o stream, desmuta, beep. Retorna os frames por valor (evita a race
+    do _frames global). None se nao estava gravando."""
     global _recording, _stream, _frames
     with _state_lock:
         if not _recording:
-            return
+            return None
         _recording = False
     try:
         _stream.stop()
@@ -533,11 +735,72 @@ def slot_stop():
         pass
     unmute_system()
     beep(440)
-    overlay.show_busy()
-    # entrega os frames pro worker por argumento: se uma nova gravacao comecar
-    # antes da transcricao ler os frames, o `_frames = []` do slot_start nao
-    # apaga o audio desta (race que ja perdeu gravacao na pratica).
     frames, _frames = _frames, []
+    return frames
+
+
+def slot_handsfree_toggle():
+    """Aperto do atalho OU clique no Parar. Decide start/stop conforme o estado.
+    Um ditado por vez: se o hold-to-talk grava, ignora."""
+    if _recording and _rec_mode == "hold":
+        return
+    if _recording and _rec_mode == "handsfree":
+        _handsfree_stop()
+    elif not _recording:
+        _handsfree_start()
+
+
+def _handsfree_start():
+    global _rec_mode, _hf_target_hwnd
+    _hf_target_hwnd = _get_foreground()   # captura o alvo ANTES de abrir a pill
+    hf_window.show_recording()            # visual instantaneo (pill nao rouba foco)
+    if _begin_capture():
+        _rec_mode = "handsfree"
+        log("Gravando (maos-livres)...")
+    else:
+        hf_window.hide_it()
+
+
+def _handsfree_stop():
+    global _rec_mode
+    frames = _end_capture()
+    _rec_mode = None
+    hf_window.show_busy()
+    threading.Thread(
+        target=worker, args=(frames,),
+        kwargs=dict(mode="handsfree", target_hwnd=_hf_target_hwnd), daemon=True,
+    ).start()
+
+
+def slot_handsfree_cancel():
+    """ESC durante a gravacao maos-livres: descarta (nao transcreve/cola/salva)."""
+    global _rec_mode
+    if _recording and _rec_mode == "handsfree":
+        _end_capture()   # fecha stream/desmuta; frames sao descartados
+        _rec_mode = None
+        hf_window.hide_it()
+        log("Maos-livres cancelado (ESC).")
+
+
+def slot_start():
+    global _rec_mode
+    overlay.show_recording()   # visual instantaneo, antes de abrir o audio (que pode demorar a frio)
+    if _t_press:
+        log(f"[t] tecla->overlay {(time.perf_counter() - _t_press) * 1000:.0f}ms")
+    if _begin_capture():
+        _rec_mode = "hold"
+        log("Gravando...")
+    else:
+        overlay.hide_it()
+
+
+def slot_stop():
+    global _rec_mode
+    frames = _end_capture()
+    _rec_mode = None
+    overlay.show_busy()
+    # frames entregues por valor pra evitar a race do _frames global (uma nova
+    # gravacao zerava o audio da anterior — ver _end_capture).
     threading.Thread(target=worker, args=(frames,), daemon=True).start()
 
 
@@ -599,16 +862,24 @@ def transcribe_bytes(bio):
     return "", err
 
 
-def worker(frames):
+def _emit_done(mode, secs):
+    """Sinaliza o fim pra pill certa: overlay (hold) ou HandsFreeWindow (maos-livres)."""
+    if mode == "handsfree":
+        bridge.handsfree_done.emit(secs)
+    else:
+        bridge.done.emit(secs)
+
+
+def worker(frames, mode="hold", target_hwnd=None):
     try:
         if not frames:
-            bridge.done.emit(-1.0)
+            _emit_done(mode, -1.0)
             return
         audio = np.concatenate(frames, axis=0)
         duration = len(audio) / SR
         if duration < MIN_DURATION:
             log(f"Muito curto ({duration:.2f}s), ignorado.")
-            bridge.done.emit(-1.0)
+            _emit_done(mode, -1.0)
             return
 
         # salva o audio em disco ANTES de transcrever — se o processo cair no
@@ -633,28 +904,31 @@ def worker(frames):
 
         if err or not text:
             if err:
-                bridge.done.emit(-2.0)
+                _emit_done(mode, -2.0)
                 log("Falhou na API (audio guardado em pendentes/ pra retry no boot).")
             else:
-                bridge.done.emit(-3.0)
+                _emit_done(mode, -3.0)
                 log("Transcricao vazia.")
                 # vazio nao e queda — descarta o pendente pra nao re-tentar a toa
                 _safe_remove(wav_path)
             beep(220, 280)
             return
 
-        bridge.done.emit(elapsed)
+        _emit_done(mode, elapsed)
         now = datetime.datetime.now()
         save_history(text, now)
         log(f"({elapsed:.1f}s) -> {text}")
         archive_audio(wav_path, now)   # guarda o audio pra ouvir/re-transcrever no app
-        paste(text + " ")
+        if mode == "handsfree":
+            _focus_and_paste(text + " ", target_hwnd)   # reforca o foco no alvo antes do Ctrl+V
+        else:
+            paste(text + " ")
     except Exception:
         # blindagem: qualquer erro inesperado vira log com traceback em vez de
         # matar a thread/processo em silencio (foi o que aconteceu no crash de 11:38).
         log("ERRO inesperado no worker:\n" + traceback.format_exc())
         try:
-            bridge.done.emit(-1.0)
+            _emit_done(mode, -1.0)
         except Exception:
             pass
         beep(220, 280)
@@ -718,18 +992,44 @@ def _combo_held():
     return all(_pressed & token for token in HOTKEY)
 
 
+def _handsfree_held():
+    """True quando o chord do atalho maos-livres esta 100% pressionado."""
+    return all(_pressed & token for token in HANDSFREE_HOTKEY)
+
+
 def on_press(key):
-    global _t_press
+    global _t_press, _handsfree_combo_active
     _pressed.add(key)
+
+    # hold-to-talk (level-triggered): grava enquanto segura a HOTKEY
     if not _recording and _combo_held():
         _t_press = time.perf_counter()
         bridge.start.emit()
 
+    # maos-livres (edge-triggered): um toque no chord alterna start/stop.
+    # Trava anti-repeat: o auto-repeat da tecla nao dispara de novo ate soltar.
+    if _handsfree_held():
+        if not _handsfree_combo_active:
+            _handsfree_combo_active = True
+            bridge.handsfree_toggle.emit()
+
+    # ESC cancela — so quando o maos-livres esta gravando (a pill nao tem foco de
+    # teclado por ser NOACTIVATE, entao o ESC vem do listener global, nao dela)
+    if key == keyboard.Key.esc and _recording and _rec_mode == "handsfree":
+        bridge.handsfree_cancel.emit()
+
 
 def on_release(key):
+    global _handsfree_combo_active
     _pressed.discard(key)
-    if _recording and not _combo_held():
+
+    # hold-to-talk para so quando quem grava e o hold (nao o maos-livres)
+    if _recording and _rec_mode == "hold" and not _combo_held():
         bridge.stop.emit()
+
+    # rearma o maos-livres quando o chord e solto
+    if _handsfree_combo_active and not _handsfree_held():
+        _handsfree_combo_active = False
 
 
 def _log_uncaught(exc_type, exc_value, exc_tb):
@@ -758,19 +1058,26 @@ def main():
         log("OPENAI_API_KEY ausente no .env. Abortando.")
         sys.exit(1)
 
-    global bridge, overlay
+    global bridge, overlay, hf_window
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
     bridge = Bridge()
     overlay = Overlay()
+    hf_window = HandsFreeWindow()
     bridge.start.connect(slot_start)
     bridge.stop.connect(slot_stop)
     bridge.done.connect(overlay.show_done)
+    bridge.handsfree_toggle.connect(slot_handsfree_toggle)
+    bridge.handsfree_cancel.connect(slot_handsfree_cancel)
+    bridge.handsfree_done.connect(hf_window.show_done)
 
     # icone na bandeja (cara de programa instalado + botao Sair)
     tray = QSystemTrayIcon(QIcon(ICON_PATH), app)
-    tray.setToolTip(f"whisper-voice — segura {HOTKEY_LABEL} pra ditar")
+    tray.setToolTip(
+        f"whisper-voice — segura {HOTKEY_LABEL} pra ditar · "
+        f"{HANDSFREE_LABEL} pra maos-livres"
+    )
     menu = QMenu()
     act_quit = QAction("Sair", app)
     act_quit.triggered.connect(app.quit)
@@ -800,7 +1107,8 @@ def main():
     # apaga audios alem da janela de retencao (texto fica; so o wav e rolling)
     threading.Thread(target=prune_old_audios, daemon=True).start()
 
-    log(f"whisper-voice pronto. Segura {HOTKEY_LABEL}, fala, solta.")
+    log(f"whisper-voice pronto. Segura {HOTKEY_LABEL}, fala, solta. "
+        f"Maos-livres: {HANDSFREE_LABEL} (toggle).")
     sys.exit(app.exec_())
 
 
