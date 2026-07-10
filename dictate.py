@@ -338,6 +338,68 @@ class Bridge(QObject):
     handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
 
 
+def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
+    """FONTE UNICA da animacao da pill — o Overlay (hold-to-talk) e a
+    HandsFreeWindow (maos-livres) desenham pela MESMA funcao, entao a animacao e
+    identica e nao ha codigo duplicado. Pinta num retangulo w x h com origem em
+    (0,0); quem tem a pill numa sub-area (ex: a maos-livres, com botao ao lado)
+    translada o painter antes de chamar."""
+    cy = h / 2
+    # pill: fundo quase 100% preto + borda sutil
+    p.setPen(QPen(QColor(255, 255, 255, 20), 1))
+    p.setBrush(QColor(6, 6, 7, 250))
+    p.drawRoundedRect(QRect(1, 1, w - 2, h - 2), h / 2 - 1, h / 2 - 1)
+
+    if mode == "busy":
+        # spinner: arco girando (cinza, minimalista)
+        ang = int((time.time() * 320) % 360)
+        pen = QPen(QColor("#A6A6AC"), 2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(QRect(15, int(cy - 6), 12, 12), -ang * 16, 110 * 16)
+        dots = "." * (int(time.time() * 2.5) % 4)
+        p.setPen(QColor("#C9C9CE"))
+        p.setFont(QFont("Segoe UI", 9))
+        p.drawText(QRect(36, 0, w - 48, h), Qt.AlignVCenter | Qt.AlignLeft,
+                   f"transcrevendo{dots}")
+        return
+    if mode in ("done", "fail"):
+        ok = mode == "done"
+        p.setPen(QColor("#D8D8DC") if ok else QColor("#F87171"))
+        p.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
+        mark = "✓  " if ok else "✕  "
+        p.drawText(QRect(0, 0, w, h), Qt.AlignCenter, mark + msg)
+        return
+
+    # rec: ponto REC vermelho pulsando — unica cor do overlay
+    pulse = 0.5 + 0.5 * math.sin(time.time() * 3.5)
+    p.setPen(Qt.NoPen)
+    p.setBrush(QColor(235, 70, 70, int(130 + 125 * pulse)))
+    p.drawEllipse(13, int(cy - 3), 7, 7)
+
+    # onda espelhada em cinza
+    timer_w = 46
+    x0 = 28
+    area_w = w - x0 - timer_w - 10
+    spacing = area_w / (N_POINTS - 1)
+    amp = h * 0.32
+    pen = QPen(QColor("#9A9AA0"), 2.0)
+    pen.setCapStyle(Qt.RoundCap)
+    p.setPen(pen)
+    for i, lvl in enumerate(levels):
+        ext = max(1.0, lvl * amp)
+        x = x0 + i * spacing
+        p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
+
+    # timer de gravacao (cinza quase branco)
+    e = time.time() - rec_start
+    txt = f"{int(e // 60)}:{int(e % 60):02d}" if e >= 60 else f"{e:0.1f}s"
+    p.setPen(QColor("#E3E3E7"))
+    p.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
+    p.drawText(QRect(w - timer_w - 13, 0, timer_w, h),
+               Qt.AlignVCenter | Qt.AlignRight, txt)
+
+
 class Overlay(QWidget):
     """Pill flutuante embaixo da tela. Estados: rec (onda + timer), busy
     (spinner + "transcrevendo"), done ("colado" verde) e fail (erro vermelho).
@@ -446,79 +508,24 @@ class Overlay(QWidget):
     def paintEvent(self, event):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        cy = h / 2
-
-        # pill: fundo quase 100% preto + borda sutil
-        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
-        p.setBrush(QColor(6, 6, 7, 250))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), h / 2 - 1, h / 2 - 1)
-
-        if self.mode == "busy":
-            self._paint_busy(p, w, h, cy)
-        elif self.mode in ("done", "fail"):
-            ok = self.mode == "done"
-            p.setPen(QColor("#D8D8DC") if ok else QColor("#F87171"))
-            p.setFont(QFont("Segoe UI", 10, QFont.DemiBold))
-            mark = "✓  " if ok else "✕  "
-            p.drawText(self.rect(), Qt.AlignCenter, mark + self.msg)
-        else:
-            self._paint_rec(p, w, h, cy)
-
-    def _paint_busy(self, p, w, h, cy):
-        # spinner: arco girando (cinza, minimalista)
-        ang = int((time.time() * 320) % 360)
-        pen = QPen(QColor("#A6A6AC"), 2.0)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        p.drawArc(QRect(15, int(cy - 6), 12, 12), -ang * 16, 110 * 16)
-        # "transcrevendo" + reticencias andando
-        dots = "." * (int(time.time() * 2.5) % 4)
-        p.setPen(QColor("#C9C9CE"))
-        p.setFont(QFont("Segoe UI", 9))
-        p.drawText(QRect(36, 0, w - 48, h), Qt.AlignVCenter | Qt.AlignLeft,
-                   f"transcrevendo{dots}")
-
-    def _paint_rec(self, p, w, h, cy):
-        # ponto REC vermelho pulsando — unica cor do overlay
-        pulse = 0.5 + 0.5 * math.sin(time.time() * 3.5)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(235, 70, 70, int(130 + 125 * pulse)))
-        p.drawEllipse(13, int(cy - 3), 7, 7)
-
-        # onda espelhada em cinza
-        timer_w = 46
-        x0 = 28
-        area_w = w - x0 - timer_w - 10
-        spacing = area_w / (N_POINTS - 1)
-        amp = h * 0.32
-        pen = QPen(QColor("#9A9AA0"), 2.0)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        for i, lvl in enumerate(self.levels):
-            ext = max(1.0, lvl * amp)
-            x = x0 + i * spacing
-            p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
-
-        # timer de gravacao (cinza quase branco)
-        e = time.time() - self.rec_start
-        txt = f"{int(e // 60)}:{int(e % 60):02d}" if e >= 60 else f"{e:0.1f}s"
-        p.setPen(QColor("#E3E3E7"))
-        p.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
-        p.drawText(QRect(w - timer_w - 13, 0, timer_w, h),
-                   Qt.AlignVCenter | Qt.AlignRight, txt)
+        _draw_pill(p, self.width(), self.height(), self.mode,
+                   self.levels, self.rec_start, self.msg)
 
 
 class HandsFreeWindow(QWidget):
-    """Pill do modo maos-livres: mesmo visual preto do Overlay, mas com um botao
-    Parar clicavel. Nao rouba foco (WS_EX_NOACTIVATE via WindowDoesNotAcceptFocus
-    + WA_ShowWithoutActivating) — recebe clique de mouse sem ativar, o que faz o
-    auto-paste cair na janela de tras, nao nela. Estados: rec (onda+timer+Parar),
-    busy (transcrevendo), done ("colado") e fail (erro). Parar e a hotkey de novo
-    fazem a mesma coisa (toggle), ambos via bridge.handsfree_toggle."""
+    """Pill do modo maos-livres. A pill em si e IDENTICA a do Overlay (mesma
+    animacao, desenhada pela mesma _draw_pill — sem duplicar) ocupando a esquerda
+    240x36; a unica diferenca e um botao Parar clicavel do lado direito. Nao rouba
+    foco (WS_EX_NOACTIVATE via WindowDoesNotAcceptFocus + WA_ShowWithoutActivating)
+    — recebe clique de mouse sem ativar, o que faz o auto-paste cair na janela de
+    tras, nao nela. Estados: rec (onda+timer+Parar), busy (transcrevendo), done
+    ("colado") e fail (erro). Parar e a hotkey de novo fazem a mesma coisa
+    (toggle), ambos via bridge.handsfree_toggle."""
 
-    W, H = 300, 48
+    PILL_W, PILL_H = Overlay.W, Overlay.H   # pill exatamente do tamanho do overlay
+    GAP = 8
     BTN_W = 74
+    W, H = PILL_W + GAP + BTN_W, PILL_H
 
     def __init__(self):
         super().__init__(
@@ -545,7 +552,8 @@ class HandsFreeWindow(QWidget):
             " font: 600 10pt 'Segoe UI'; padding: 0 4px; }"
             "QPushButton:hover { background: rgba(235,70,70,90); }"
         )
-        self.btn.setGeometry(self.W - self.BTN_W - 10, 11, self.BTN_W, self.H - 22)
+        # botao ao lado da pill (a pill ocupa a esquerda PILL_W; botao a direita)
+        self.btn.setGeometry(self.PILL_W + self.GAP, 2, self.BTN_W, self.H - 4)
         self.btn.clicked.connect(lambda: bridge.handsfree_toggle.emit())
 
         self._repaint = QTimer(self)
@@ -617,59 +625,12 @@ class HandsFreeWindow(QWidget):
         self.hide()
 
     def paintEvent(self, event):
+        # desenha a pill IDENTICA a do Overlay na sub-area esquerda (PILL_W x
+        # PILL_H); o botao Parar (QPushButton filho) fica a direita, no gap.
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        cy = h / 2
-        p.setPen(QPen(QColor(255, 255, 255, 20), 1))
-        p.setBrush(QColor(6, 6, 7, 250))
-        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 16, 16)
-
-        if self.mode == "busy":
-            ang = int((time.time() * 320) % 360)
-            pen = QPen(QColor("#A6A6AC"), 2.0)
-            pen.setCapStyle(Qt.RoundCap)
-            p.setPen(pen)
-            p.drawArc(QRect(18, int(cy - 7), 14, 14), -ang * 16, 110 * 16)
-            dots = "." * (int(time.time() * 2.5) % 4)
-            p.setPen(QColor("#C9C9CE"))
-            p.setFont(QFont("Segoe UI", 10))
-            p.drawText(QRect(42, 0, w - 54, h), Qt.AlignVCenter | Qt.AlignLeft,
-                       f"transcrevendo{dots}")
-            return
-        if self.mode in ("done", "fail"):
-            ok = self.mode == "done"
-            p.setPen(QColor("#D8D8DC") if ok else QColor("#F87171"))
-            p.setFont(QFont("Segoe UI", 11, QFont.DemiBold))
-            mark = "✓  " if ok else "✕  "
-            p.drawText(self.rect(), Qt.AlignCenter, mark + self.msg)
-            return
-
-        # rec: ponto vermelho + onda + timer (a onda para antes do botao)
-        pulse = 0.5 + 0.5 * math.sin(time.time() * 3.5)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(235, 70, 70, int(130 + 125 * pulse)))
-        p.drawEllipse(15, int(cy - 4), 8, 8)
-
-        timer_w = 46
-        x0 = 32
-        area_w = w - x0 - timer_w - self.BTN_W - 22
-        spacing = area_w / (N_POINTS - 1)
-        amp = h * 0.30
-        pen = QPen(QColor("#9A9AA0"), 2.0)
-        pen.setCapStyle(Qt.RoundCap)
-        p.setPen(pen)
-        for i, lvl in enumerate(self.levels):
-            ext = max(1.0, lvl * amp)
-            x = x0 + i * spacing
-            p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
-
-        e = time.time() - self.rec_start
-        txt = f"{int(e // 60)}:{int(e % 60):02d}" if e >= 60 else f"{e:0.1f}s"
-        p.setPen(QColor("#E3E3E7"))
-        p.setFont(QFont("Segoe UI", 9, QFont.DemiBold))
-        p.drawText(QRect(x0 + int(area_w) + 4, 0, timer_w, h),
-                   Qt.AlignVCenter | Qt.AlignRight, txt)
+        _draw_pill(p, self.PILL_W, self.PILL_H, self.mode,
+                   self.levels, self.rec_start, self.msg)
 
 
 def _get_foreground():
