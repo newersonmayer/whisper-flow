@@ -6,7 +6,7 @@ Overlay discreto (onda em tempo real, fundo preto) embaixo no centro da tela.
 Mostra o tempo da transcricao ao terminar. Icone na bandeja com "Sair".
 
 - Instancia unica. Sobe sozinho no boot (atalho na pasta Startup).
-- Overlay nao rouba foco. Cola via clipboard (preserva acentos) e restaura.
+- Overlay nao rouba foco. Cola via clipboard (preserva acentos); o texto fica no clipboard pra Ctrl+V manual.
 """
 import os
 import io
@@ -932,20 +932,13 @@ def recover_pending():
 
 
 def paste(text):
-    try:
-        previous = pyperclip.paste()
-    except Exception:
-        previous = ""
+    # O texto FICA no clipboard de proposito (nao restaura o anterior):
+    # se o foco estava no campo errado, basta Ctrl+V manual em seguida.
     pyperclip.copy(text)
     time.sleep(0.08)
     with kb.pressed(keyboard.Key.ctrl):
         kb.press("v")
         kb.release("v")
-    time.sleep(0.35)
-    try:
-        pyperclip.copy(previous)
-    except Exception:
-        pass
 
 
 def _combo_held():
