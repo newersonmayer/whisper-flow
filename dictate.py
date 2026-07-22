@@ -39,6 +39,7 @@ from PyQt5.QtCore import Qt, QObject, pyqtSignal, QRect, QTimer
 from PyQt5.QtGui import QPainter, QColor, QFont, QPen, QIcon, QCursor
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QPushButton,
+    QLabel, QVBoxLayout, QHBoxLayout,
 )
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -164,6 +165,7 @@ kb = keyboard.Controller()
 bridge = None
 overlay = None
 hf_window = None
+popup = None
 
 _frames = []
 _stream = None
@@ -278,6 +280,21 @@ def read_setting(key, default):
             return json.load(f).get(key, default)
     except Exception:
         return default
+
+
+def write_setting(key, value):
+    """Grava uma preferencia no settings.json (ex: posicao do popup)."""
+    try:
+        try:
+            with open(SETTINGS_PATH, encoding="utf-8") as f:
+                s = json.load(f)
+        except Exception:
+            s = {}
+        s[key] = value
+        with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+            json.dump(s, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log(f"falha ao salvar setting {key}: {e}")
 
 
 def read_vocab():
@@ -403,6 +420,7 @@ class Bridge(QObject):
     handsfree_toggle = pyqtSignal()   # aperto do atalho maos-livres OU clique no Parar
     handsfree_cancel = pyqtSignal()   # ESC: descarta sem transcrever
     handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
+    popup = pyqtSignal(str, float)    # (texto, segundos) -> ResultPopup (thread da UI)
 
 
 def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
@@ -700,6 +718,161 @@ class HandsFreeWindow(QWidget):
                    self.levels, self.rec_start, self.msg)
 
 
+class ResultPopup(QWidget):
+    """Popup flutuante pos-transcricao: preview do texto + Copiar + fechar.
+    Substitui o flash "colado" da pill quando ligado (popup_enabled, aba
+    Ajustes). Nao rouba foco (mesmas flags NOACTIVATE da pill) — o cursor
+    continua no campo onde o texto foi colado.
+
+    Arrastavel: a posicao onde o usuario soltar e salva no settings.json e
+    vira o lugar fixo dele. Como a coordenada e absoluta no desktop virtual,
+    ela codifica tambem O MONITOR (setup multi-tela): arrastou pra tela da
+    direita uma vez, todo popup seguinte nasce la. Se o monitor salvo sumir
+    (ex: notebook fora do dock), cai pro canto da tela do cursor."""
+
+    W, H = 380, 96
+    MARGIN = 18
+
+    def __init__(self):
+        super().__init__(
+            None,
+            Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.Tool
+            | Qt.WindowDoesNotAcceptFocus,
+        )
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setAttribute(Qt.WA_ShowWithoutActivating)
+        self.setFixedSize(self.W, self.H)
+        self._text = ""
+        self._drag = None      # offset do clique durante o arrasto
+        self._dragged = False
+
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 9, 10, 10)
+        v.setSpacing(3)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        self.head = QLabel("")
+        self.head.setStyleSheet(
+            "color:#8E8E96; font:600 9pt 'Segoe UI'; background:transparent;")
+        top.addWidget(self.head)
+        top.addStretch(1)
+
+        self.copy_btn = QPushButton("Copiar")
+        self.copy_btn.setCursor(Qt.PointingHandCursor)
+        self.copy_btn.setFocusPolicy(Qt.NoFocus)
+        self.copy_btn.setStyleSheet(
+            "QPushButton { color:#C9C9CE; background:rgba(255,255,255,14);"
+            " border:1px solid rgba(255,255,255,26); border-radius:9px;"
+            " font:600 8.5pt 'Segoe UI'; padding:2px 10px; }"
+            "QPushButton:hover { background:rgba(255,255,255,32); }")
+        self.copy_btn.clicked.connect(self._copy)
+        top.addWidget(self.copy_btn)
+
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setCursor(Qt.PointingHandCursor)
+        self.close_btn.setFocusPolicy(Qt.NoFocus)
+        self.close_btn.setStyleSheet(
+            "QPushButton { color:#6E6E76; background:transparent; border:none;"
+            " font:600 9pt 'Segoe UI'; padding:2px 6px; }"
+            "QPushButton:hover { color:#E3E3E7; }")
+        self.close_btn.clicked.connect(self.hide_it)
+        top.addWidget(self.close_btn)
+        v.addLayout(top)
+
+        self.body = QLabel("")
+        self.body.setWordWrap(True)
+        self.body.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.body.setStyleSheet(
+            "color:#E3E3E7; font:9.5pt 'Segoe UI'; background:transparent;")
+        v.addWidget(self.body, 1)
+
+        self._hide_timer = QTimer(self)
+        self._hide_timer.setSingleShot(True)
+        self._hide_timer.timeout.connect(self.hide_it)
+
+    # ---- exibicao ----
+
+    def show_text(self, text, secs):
+        self._text = text
+        self.head.setText(f"✓  colado · {secs:.1f}s")
+        short = " ".join(text.split())
+        if len(short) > 150:   # ~2 linhas na largura do popup
+            short = short[:150].rstrip() + "…"
+        self.body.setText(short)
+        self.copy_btn.setText("Copiar")
+        self._place()
+        self.show()
+        self.raise_()
+        self._hide_timer.start(6000)
+
+    def _place(self):
+        pos = read_setting("popup_pos", None)
+        if isinstance(pos, list) and len(pos) == 2:
+            target = QRect(int(pos[0]), int(pos[1]), self.W, self.H)
+            for s in QApplication.screens():
+                if s.availableGeometry().intersects(target):
+                    self.move(target.topLeft())
+                    return
+        # sem posicao salva (ou monitor sumiu): canto inferior direito da tela
+        # do cursor, estilo notificacao
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        scr = screen.availableGeometry()
+        self.move(scr.x() + scr.width() - self.W - self.MARGIN,
+                  scr.y() + scr.height() - self.H - self.MARGIN)
+
+    def hide_it(self):
+        self._hide_timer.stop()
+        self.hide()
+
+    def _copy(self):
+        if not self._text:
+            return
+        try:
+            pyperclip.copy(self._text)
+            self.copy_btn.setText("Copiado ✓")
+        except Exception as e:
+            log(f"popup copiar falhou: {e}")
+
+    # ---- hover segura o popup na tela ----
+
+    def enterEvent(self, e):
+        self._hide_timer.stop()
+
+    def leaveEvent(self, e):
+        if not self._drag:
+            self._hide_timer.start(2500)
+
+    # ---- arrasto (posicao vira a casa fixa do popup) ----
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self._drag = e.globalPos() - self.frameGeometry().topLeft()
+            self._dragged = False
+            self._hide_timer.stop()
+
+    def mouseMoveEvent(self, e):
+        if self._drag is not None and e.buttons() & Qt.LeftButton:
+            self.move(e.globalPos() - self._drag)
+            self._dragged = True
+
+    def mouseReleaseEvent(self, e):
+        if self._drag is not None and self._dragged:
+            write_setting("popup_pos", [self.x(), self.y()])
+            log(f"popup ancorado em {self.x()},{self.y()}")
+        self._drag = None
+        self._hide_timer.start(6000)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(255, 255, 255, 22), 1))
+        p.setBrush(QColor(8, 8, 9, 248))
+        p.drawRoundedRect(self.rect().adjusted(1, 1, -1, -1), 12, 12)
+
+
 def _get_foreground():
     """HWND da janela em foco agora (o alvo do auto-paste no modo maos-livres)."""
     try:
@@ -942,7 +1115,12 @@ def worker(frames, mode="hold", target_hwnd=None):
             beep(220, 280)
             return
 
-        _emit_done(mode, elapsed)
+        if read_setting("popup_enabled", True):
+            # popup e o feedback de sucesso: pill some em silencio (-1.0)
+            bridge.popup.emit(text, elapsed)
+            _emit_done(mode, -1.0)
+        else:
+            _emit_done(mode, elapsed)
         now = datetime.datetime.now()
         save_history(text, now)
         log(f"({elapsed:.1f}s) -> {text}")
@@ -1093,19 +1271,21 @@ def main():
         log("OPENAI_API_KEY ausente no .env. Abortando.")
         sys.exit(1)
 
-    global bridge, overlay, hf_window
+    global bridge, overlay, hf_window, popup
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
 
     bridge = Bridge()
     overlay = Overlay()
     hf_window = HandsFreeWindow()
+    popup = ResultPopup()
     bridge.start.connect(slot_start)
     bridge.stop.connect(slot_stop)
     bridge.done.connect(overlay.show_done)
     bridge.handsfree_toggle.connect(slot_handsfree_toggle)
     bridge.handsfree_cancel.connect(slot_handsfree_cancel)
     bridge.handsfree_done.connect(hf_window.show_done)
+    bridge.popup.connect(popup.show_text)
 
     # icone na bandeja (cara de programa instalado + botao Sair)
     tray = QSystemTrayIcon(QIcon(ICON_PATH), app)

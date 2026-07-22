@@ -771,6 +771,22 @@ class SettingsPanel(QWidget):
         title.setObjectName("pageTitle")
         v.addWidget(title)
 
+        v.addWidget(self._card(
+            "Manter a transcrição no clipboard",
+            "Ligado: depois de colar, o texto fica no Ctrl+V (útil se o foco "
+            "estava no campo errado). Desligado: o que você tinha copiado antes "
+            "de ditar volta pro clipboard após a colagem.",
+            "keep_clipboard", True))
+        v.addWidget(self._card(
+            "Popup flutuante com a transcrição",
+            "Depois de cada ditado, um popup mostra o começo do texto com um "
+            "botão Copiar (substitui o \"colado ✓\" da pill). Arraste o popup "
+            "uma vez pro canto/tela onde quer que ele sempre apareça — a "
+            "posição fica salva.",
+            "popup_enabled", True))
+        v.addStretch(1)
+
+    def _card(self, title, desc, key, default):
         card = CardWidget()
         cv = QHBoxLayout(card)
         cv.setContentsMargins(18, 14, 18, 14)
@@ -778,30 +794,24 @@ class SettingsPanel(QWidget):
 
         col = QVBoxLayout()
         col.setSpacing(3)
-        lab = QLabel("Manter a transcrição no clipboard")
+        lab = QLabel(title)
         lab.setObjectName("body")
-        desc = QLabel(
-            "Ligado: depois de colar, o texto fica no Ctrl+V (útil se o foco "
-            "estava no campo errado). Desligado: o que você tinha copiado antes "
-            "de ditar volta pro clipboard após a colagem."
-        )
-        desc.setObjectName("hint")
-        desc.setWordWrap(True)
+        d = QLabel(desc)
+        d.setObjectName("hint")
+        d.setWordWrap(True)
         col.addWidget(lab)
-        col.addWidget(desc)
+        col.addWidget(d)
         cv.addLayout(col, 1)
 
-        self.keep_switch = SwitchButton()
-        self.keep_switch.setChecked(load_settings().get("keep_clipboard", True))
-        self.keep_switch.checkedChanged.connect(self._on_keep)
-        cv.addWidget(self.keep_switch, 0, Qt.AlignVCenter)
+        switch = SwitchButton()
+        switch.setChecked(load_settings().get(key, default))
+        switch.checkedChanged.connect(lambda c, k=key: self._save(k, c))
+        cv.addWidget(switch, 0, Qt.AlignVCenter)
+        return card
 
-        v.addWidget(card)
-        v.addStretch(1)
-
-    def _on_keep(self, checked):
+    def _save(self, key, checked):
         try:
-            save_setting("keep_clipboard", bool(checked))
+            save_setting(key, bool(checked))
         except Exception as ex:
             InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
                           position=InfoBarPosition.TOP_RIGHT, duration=4000)
