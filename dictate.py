@@ -12,6 +12,7 @@ import os
 import io
 import re
 import sys
+import json
 import glob
 import math
 import time
@@ -24,6 +25,7 @@ import datetime
 import traceback
 from collections import deque
 
+import httpx
 import numpy as np
 import sounddevice as sd
 import soundfile as sf
@@ -142,10 +144,21 @@ AUDIO_DIR = os.path.join(BASE, "audios")     # acervo dos audios ja transcritos 
 AUDIO_RETENTION_DAYS = 7
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")           # editavel pelo app Transcricoes
 VOCAB_EXAMPLE = os.path.join(BASE, "vocabulario.example.txt")
+SETTINGS_PATH = os.path.join(BASE, "settings.json")          # preferencias da aba Ajustes
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
-WARMUP_EVERY_MS = 240_000     # ping leve pra manter DNS/TLS/processo quentes
+# Ping periodico + keep-alive de 120s no pool: com ping a cada 90s a MESMA
+# conexao TLS e reusada em toda transcricao (o default do httpx expira o
+# keep-alive em 5s, entao o ping antigo de 4min nao reusava nada — cada ditado
+# pagava handshake novo).
+WARMUP_EVERY_MS = 90_000
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+client = OpenAI(
+    api_key=os.getenv("OPENAI_API_KEY"),
+    http_client=httpx.Client(
+        limits=httpx.Limits(max_keepalive_connections=5, max_connections=10,
+                            keepalive_expiry=120),
+    ),
+)
 kb = keyboard.Controller()
 
 bridge = None
@@ -256,6 +269,17 @@ def save_history(text, now=None):
         log(f"historico falhou: {e}")
 
 
+def read_setting(key, default):
+    """Preferencia do settings.json (aba Ajustes do app Transcricoes). Lida a
+    cada uso — salvar la ja vale no proximo ditado, sem reiniciar nada (mesmo
+    padrao do vocabulario)."""
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f).get(key, default)
+    except Exception:
+        return default
+
+
 def read_vocab():
     """Vocabulario (termos que a transcricao costuma errar) -> prompt da API.
     Lido a cada gravacao: editar/salvar no app Transcricoes ja vale na proxima,
@@ -293,6 +317,49 @@ def warmup_api(quiet=False):
         finally:
             _warmup_busy.release()
     threading.Thread(target=run, daemon=True).start()
+
+
+def warmup_insistente():
+    """Aquecimento pos-boot/suspensao: o log mostrou a 1a chamada levando 6-16s
+    logo apos ligar o PC (rede subindo, DNS, TLS). Um ping so nao basta — este
+    insiste ate a API responder rapido (<2s) ou esgotar as tentativas, pra
+    primeira ditada do dia ja pegar caminho quente."""
+    def run():
+        if not _warmup_busy.acquire(blocking=False):
+            return
+        try:
+            for i in range(4):
+                t0 = time.perf_counter()
+                try:
+                    client.models.list()
+                    ms = (time.perf_counter() - t0) * 1000
+                    log(f"[t] warmup boot {i + 1}/4: {ms:.0f}ms")
+                    if ms < 2000:
+                        return
+                except Exception as e:
+                    log(f"warmup boot {i + 1}/4 falhou: {str(e)[:80]}")
+                time.sleep(5)
+        finally:
+            _warmup_busy.release()
+    threading.Thread(target=run, daemon=True).start()
+
+
+_last_warm_tick = time.time()
+
+
+def _periodic_warmup():
+    """Tick do timer de aquecimento. Se o relogio pulou muito alem do intervalo,
+    o PC estava suspenso (QTimer nao roda dormindo) — reaquece com o mesmo
+    tratamento do boot em vez do ping unico."""
+    global _last_warm_tick
+    now = time.time()
+    gap = now - _last_warm_tick
+    _last_warm_tick = now
+    if gap > (WARMUP_EVERY_MS / 1000) * 2:
+        log(f"[t] acordou de suspensao (gap {gap / 60:.0f}min); reaquecendo")
+        warmup_insistente()
+    else:
+        warmup_api(quiet=True)
 
 
 def archive_audio(wav_path, now):
@@ -932,13 +999,27 @@ def recover_pending():
 
 
 def paste(text):
-    # O texto FICA no clipboard de proposito (nao restaura o anterior):
-    # se o foco estava no campo errado, basta Ctrl+V manual em seguida.
+    # keep_clipboard ON (default): o texto FICA no clipboard (se o foco estava
+    # no campo errado, basta Ctrl+V manual). OFF: restaura o clipboard anterior
+    # depois de colar (comportamento antigo, escolhido na aba Ajustes).
+    keep = read_setting("keep_clipboard", True)
+    previous = ""
+    if not keep:
+        try:
+            previous = pyperclip.paste()
+        except Exception:
+            previous = ""
     pyperclip.copy(text)
     time.sleep(0.08)
     with kb.pressed(keyboard.Key.ctrl):
         kb.press("v")
         kb.release("v")
+    if not keep:
+        time.sleep(0.35)
+        try:
+            pyperclip.copy(previous)
+        except Exception:
+            pass
 
 
 def _combo_held():
@@ -1045,12 +1126,12 @@ def main():
     except Exception as e:
         log(f"warmup audio: {e}")
 
-    # pre-aquece a API (1a chamada fria levava 12-15s vs 1-3s quente) e mantem
-    # quente com ping periodico leve
-    warmup_api()
+    # pre-aquece a API (1a chamada fria levava 6-16s vs 1-3s quente) e mantem
+    # quente com ping periodico que reusa a conexao do pool
+    warmup_insistente()
     warm_timer = QTimer()
     warm_timer.setInterval(WARMUP_EVERY_MS)
-    warm_timer.timeout.connect(lambda: warmup_api(quiet=True))
+    warm_timer.timeout.connect(_periodic_warmup)
     warm_timer.start()
 
     listener = keyboard.Listener(on_press=on_press, on_release=on_release)
