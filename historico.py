@@ -17,6 +17,7 @@ import os
 import re
 import io
 import sys
+import json
 import glob
 import time
 import socket
@@ -51,13 +52,14 @@ from qfluentwidgets import (
     FluentWindow, FluentIcon, NavigationItemPosition, setTheme, Theme,
     setThemeColor, SearchLineEdit, PrimaryPushButton, TransparentPushButton,
     PushButton, PlainTextEdit, CardWidget, SmoothScrollArea, InfoBar,
-    InfoBarPosition,
+    InfoBarPosition, SwitchButton,
 )
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 HIST_DIR = os.path.join(BASE, "transcricoes")
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")
 VOCAB_EXAMPLE = os.path.join(BASE, "vocabulario.example.txt")
+SETTINGS_PATH = os.path.join(BASE, "settings.json")
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
 LINE_RE = re.compile(r"^- \*\*(\d{2}:\d{2}:\d{2})\*\* — (.*)$")
 DIAS = ["segunda", "terça", "quarta", "quinta", "sexta", "sábado", "domingo"]
@@ -211,6 +213,23 @@ def read_vocab():
         except OSError:
             continue
     return ""
+
+
+def load_settings():
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_setting(key, value):
+    """Grava uma preferencia. O dictate.py le o settings.json a cada ditado —
+    salvar aqui ja vale no proximo, sem reiniciar nada."""
+    s = load_settings()
+    s[key] = value
+    with open(SETTINGS_PATH, "w", encoding="utf-8") as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
 
 
 def load_vocab_editor():
@@ -736,6 +755,62 @@ class VocabPanel(QWidget):
                         parent=self, position=InfoBarPosition.TOP_RIGHT, duration=3000)
 
 
+class SettingsPanel(QWidget):
+    """Tela Ajustes — preferencias que o dictate.py le a cada ditado (salvou,
+    ja vale no proximo — sem reiniciar nada)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("settingsPage")
+        self.setStyleSheet(QSS)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(12)
+
+        title = QLabel("Ajustes")
+        title.setObjectName("pageTitle")
+        v.addWidget(title)
+
+        card = CardWidget()
+        cv = QHBoxLayout(card)
+        cv.setContentsMargins(18, 14, 18, 14)
+        cv.setSpacing(14)
+
+        col = QVBoxLayout()
+        col.setSpacing(3)
+        lab = QLabel("Manter a transcrição no clipboard")
+        lab.setObjectName("body")
+        desc = QLabel(
+            "Ligado: depois de colar, o texto fica no Ctrl+V (útil se o foco "
+            "estava no campo errado). Desligado: o que você tinha copiado antes "
+            "de ditar volta pro clipboard após a colagem."
+        )
+        desc.setObjectName("hint")
+        desc.setWordWrap(True)
+        col.addWidget(lab)
+        col.addWidget(desc)
+        cv.addLayout(col, 1)
+
+        self.keep_switch = SwitchButton()
+        self.keep_switch.setChecked(load_settings().get("keep_clipboard", True))
+        self.keep_switch.checkedChanged.connect(self._on_keep)
+        cv.addWidget(self.keep_switch, 0, Qt.AlignVCenter)
+
+        v.addWidget(card)
+        v.addStretch(1)
+
+    def _on_keep(self, checked):
+        try:
+            save_setting("keep_clipboard", bool(checked))
+        except Exception as ex:
+            InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
+                          position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        InfoBar.success("Ajuste salvo", "Já vale no próximo ditado.",
+                        parent=self, position=InfoBarPosition.TOP_RIGHT,
+                        duration=2500)
+
+
 class MainWindow(FluentWindow):
     def __init__(self):
         super().__init__()
@@ -762,6 +837,10 @@ class MainWindow(FluentWindow):
         self.addSubInterface(self.record, FluentIcon.MICROPHONE, "Gravar",
                              isTransparent=True)
         self.addSubInterface(self.vocab, FluentIcon.DICTIONARY, "Vocabulário",
+                             isTransparent=True)
+        self.settings = SettingsPanel()
+        self.addSubInterface(self.settings, FluentIcon.SETTING, "Ajustes",
+                             position=NavigationItemPosition.BOTTOM,
                              isTransparent=True)
 
         # sidebar com rótulos visíveis (estilo Wispr), sem colapsar

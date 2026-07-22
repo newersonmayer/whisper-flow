@@ -17,6 +17,9 @@ audios/
 # vocabulario pessoal (cada maquina tem o seu; editavel pela aba Vocabulario)
 vocabulario.txt
 
+# preferencias pessoais (aba Ajustes; cada maquina tem o seu)
+settings.json
+
 # artefatos temporarios
 _test_*
 _inv_*
