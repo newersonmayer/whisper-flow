@@ -1,0 +1,55 @@
+# Correcoes de grafia aplicadas DEPOIS da transcricao.
+#
+# Por que isto existe: nenhum modelo de transcricao aplica de forma confiavel a
+# lista de termos do vocabulario.txt. No benchmark de 28/07/2026 (10 audios reais,
+# 13,4 min de fala) o gpt-4o-mini-transcribe errou "CLAUDE.md" nas 13 vezes em que
+# ela foi dita, e "Isaque" nas 9. Este arquivo corrige isso no texto, de forma
+# deterministica — a grafia para de depender do humor do modelo.
+#
+# COMO EDITAR (uma regra por linha):
+#
+#     errado => certo
+#
+#   - o lado esquerdo e literal: "." e ponto mesmo, nao precisa saber regex;
+#   - so troca a palavra inteira: "cloud" NAO afeta "Cloudflare";
+#   - tudo minusculo casa em qualquer caixa: "cloud" pega "Cloud" e "CLOUD";
+#     com maiuscula, casa exato: "Tel" pega "Tel" mas nao "tel." de telefone;
+#   - "#" comenta a linha;
+#   - A ORDEM IMPORTA: do mais especifico pro mais generico. "cloud.md" tem que
+#     vir antes de "cloud", senao a segunda regra estraga a primeira.
+#
+# Este arquivo e a base compartilhada (versionada no git). Para termos so seus,
+# crie um "correcoes.txt" ao lado — ele SOMA a este, e nao vai pro git.
+# Vale no ditado seguinte, sem reiniciar nada.
+
+# --- Claude / CLAUDE.md (o erro mais comum: "cloud") ---
+cloud.md => CLAUDE.md
+cloud .md => CLAUDE.md
+cloud md => CLAUDE.md
+cloudmd => CLAUDE.md
+claudio.md => CLAUDE.md
+claude.md => CLAUDE.md
+ponto cloud => ponto claude
+.cloud => .claude
+cloud => Claude
+claudio => Claude
+cláudio => Claude
+clode => Claude
+
+# --- Pessoas (Grupo Amber) ---
+Tel => Theo
+Teo => Theo
+Téo => Theo
+claude.isaac => claude-isaque
+claude-isaac => claude-isaque
+isaac => Isaque
+Neverson => Newerson
+
+# --- Ferramentas ---
+post-hog => PostHog
+post hog => PostHog
+
+# --- Exemplos pra voce copiar no seu correcoes.txt ---
+# supa base => Supabase
+# next js => Next.js
+# bane => Bunny

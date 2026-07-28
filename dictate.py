@@ -133,6 +133,16 @@ LANGUAGE = "pt"
 # Modelo de transcricao. Default whisper-1 (acesso garantido em qualquer projeto).
 # Pra usar gpt-4o-mini-transcribe / gpt-4o-transcribe (mais precisos), libere o
 # acesso ao modelo no projeto da OpenAI e troque WHISPER_MODEL no .env.
+#
+# Benchmark de 2026-07-28 (10 audios reais, 13,4 min, mesmo prompt de vocabulario),
+# placar acerto/erro em nome proprio e termo tecnico:
+#   gpt-4o-mini-transcribe  25/55   <- pior; ignora o vocabulario do prompt
+#   gpt-4o-transcribe       51/35   <- recomendado (e MAIS rapido no ditado curto)
+#   whisper-1               76/10   <- melhor vocabulario, mas ecoa o prompt (~10-25%)
+# O whisper-1 acerta mais porque opera como LM condicionado pelo prompt — e e
+# exatamente isso que faz ele as vezes ECOAR a lista em vez de transcrever. Eco e
+# vocabulario sao o MESMO mecanismo; nao da pra ter um sem o outro. Por isso a
+# grafia dos termos nao depende mais do modelo: ver corrigir_termos() abaixo.
 MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 API_RETRIES = 3
 BLOCK = 320           # 20ms por bloco -> ~50 updates/s (onda fluida)
@@ -145,6 +155,12 @@ AUDIO_DIR = os.path.join(BASE, "audios")     # acervo dos audios ja transcritos 
 AUDIO_RETENTION_DAYS = 7
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")           # editavel pelo app Transcricoes
 VOCAB_EXAMPLE = os.path.join(BASE, "vocabulario.example.txt")
+# Correcoes de grafia aplicadas DEPOIS da transcricao (ver corrigir_termos).
+# Ao contrario do vocabulario, aqui os dois arquivos SOMAM: o .example versionado
+# e a base compartilhada (todo mundo que der pull ganha) e o .txt local adiciona
+# os termos pessoais de cada maquina.
+CORRECOES_PATH = os.path.join(BASE, "correcoes.txt")
+CORRECOES_EXAMPLE = os.path.join(BASE, "correcoes.example.txt")
 SETTINGS_PATH = os.path.join(BASE, "settings.json")          # preferencias da aba Ajustes
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
 # Ping periodico + keep-alive de 120s no pool: com ping a cada 90s a MESMA
@@ -310,6 +326,72 @@ def read_vocab():
         except OSError:
             continue
     return ""
+
+
+def _parse_correcoes(texto):
+    """Le linhas 'errado => certo' e devolve [(regex compilada, certo)].
+
+    Convencoes (pensadas pra quem edita o arquivo a mao, nao pra quem sabe regex):
+      - o lado esquerdo e LITERAL (nada de metacaractere: '.' e ponto mesmo);
+      - borda de palavra automatica: 'cloud' casa "cloud" mas nao "Cloudflare";
+      - smartcase, igual ao vim: tudo minusculo casa em qualquer caixa
+        ('cloud' pega "Cloud"/"CLOUD'); com qualquer maiuscula, casa exato
+        ('Tel' -> Theo nao dispara em "tel." de telefone);
+      - '#' comenta a linha; a ORDEM importa (a 1a que casar troca), por isso
+        'cloud.md' precisa vir antes de 'cloud'.
+    """
+    regras = []
+    for linha in (texto or "").splitlines():
+        linha = linha.split("#", 1)[0].strip()
+        if not linha or "=>" not in linha:
+            continue
+        errado, certo = linha.split("=>", 1)
+        errado, certo = errado.strip(), certo.strip()
+        if not errado:
+            continue
+        pat = re.escape(errado)
+        # \b so onde a borda e caractere de palavra — senao '.cloud' nunca casaria
+        if errado[:1].isalnum() or errado[:1] == "_":
+            pat = r"\b" + pat
+        if errado[-1:].isalnum() or errado[-1:] == "_":
+            pat = pat + r"\b"
+        flags = 0 if errado != errado.lower() else re.IGNORECASE
+        try:
+            regras.append((re.compile(pat, flags), certo))
+        except re.error as e:
+            log(f"correcao invalida ignorada ({errado!r}): {e}")
+    return regras
+
+
+def read_correcoes():
+    """Regras de correcao: o .example versionado + o .txt local, nessa ordem.
+
+    Lido a cada transcricao — editar o arquivo ja vale no proximo ditado, sem
+    reiniciar nada (mesma ergonomia do vocabulario)."""
+    regras = []
+    for path in (CORRECOES_EXAMPLE, CORRECOES_PATH):
+        try:
+            with open(path, encoding="utf-8") as f:
+                regras.extend(_parse_correcoes(f.read()))
+        except OSError:
+            continue
+    return regras
+
+
+def corrigir_termos(texto):
+    """Conserta a grafia de nomes proprios e termos tecnicos DEPOIS da API.
+
+    Existe porque nenhum modelo aplica o vocabulario de forma confiavel: no
+    benchmark de 2026-07-28 o gpt-4o-mini errou 55 termos em 13 min de fala
+    ("CLAUDE.md" -> "cloud.md" em 13 de 13 ocorrencias, "Isaque" -> "Isaac" em
+    9 de 9). Este passe zerou os 55 erros — em TODOS os modelos testados, e sem
+    nenhum falso positivo nas 52 substituicoes auditadas na amostra. Deterministico,
+    offline, ~0ms: a grafia deixa de depender do humor do modelo."""
+    if not texto:
+        return texto
+    for rx, certo in read_correcoes():
+        texto = rx.sub(certo, texto)
+    return texto
 
 
 _warmup_busy = threading.Lock()
@@ -1016,13 +1098,20 @@ def _looks_like_vocab_echo(text, vocab):
     vocabulario (uma lista de termos) as vezes 'cai na lista' e ecoa termos do
     prompt em vez de transcrever (investigacao jul/2026 — ~25% dos ditados). A
     fala em si e decodificavel; so a saida com prompt sai errada.
-    Deteccao: a saida (3+ palavras) e uma SUBSEQUENCIA ordenada do vocabulario —
+    Deteccao: a saida (6+ palavras) e uma SUBSEQUENCIA ordenada do vocabulario —
     toda palavra dela aparece no vocab, na mesma ordem (o modelo as vezes pula
     termos, entao 'contido' exato nao basta). Fala real tem palavras funcionais
     (de, que, nao, ta...) fora do vocab, logo nao casa. gpt-4o-transcribe nao
-    faz isso, mas o guard protege se o modelo voltar pro whisper-1."""
+    faz isso, mas o guard protege se o modelo voltar pro whisper-1.
+
+    ⚠️ O piso era 3 palavras e custou ditado: o log acusou 19 disparos, 12 deles
+    terminando em "Transcricao vazia" (fala perdida). Todos em audios curtos
+    (0,4s-5,2s) — um ditado tipo "Claude Code, commit" tem 3 palavras, todas no
+    vocabulario, e casava como eco sendo fala legitima. 6 palavras poe o piso
+    acima do ditado curto real sem perder o eco de verdade (que despeja a lista
+    inteira)."""
     t = _norm_for_echo(text).split()
-    if len(t) < 3:
+    if len(t) < 6:
         return False
     i = 0
     for w in _norm_for_echo(vocab).split():
@@ -1050,12 +1139,17 @@ def transcribe_bytes(bio):
             # guard anti-eco: se a saida for um trecho do vocabulario, o modelo
             # ecoou o prompt em vez de transcrever. Refaz sem prompt — a fala e
             # decodificavel, so o prompt sabotou (ver _looks_like_vocab_echo).
-            if vocab and text and _looks_like_vocab_echo(text, vocab):
+            # So o whisper-1 ecoa (e um LM condicionado pelo prompt); nos modelos
+            # gpt-4o-* o guard nao teria o que pegar e so arriscaria falso positivo.
+            if MODEL.startswith("whisper") and vocab and text and _looks_like_vocab_echo(text, vocab):
                 log("saida parece eco do vocabulario; refazendo sem prompt")
                 bio.seek(0)
                 r = client.audio.transcriptions.create(**base_kwargs)
-                text = (r.text or "").strip()
-            return text, None
+                # se o retry vier vazio, o ditado seria PERDIDO — melhor devolver
+                # a saida suspeita que engolir a fala (12 ocorrencias no log).
+                text = (r.text or "").strip() or text
+            # grafia dos termos: passe deterministico, nao depende do modelo
+            return corrigir_termos(text), None
         except Exception as e:
             err = str(e)[:90]
             log(f"api tentativa {attempt + 1} falhou: {err}")

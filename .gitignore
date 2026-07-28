@@ -17,6 +17,9 @@ audios/
 # vocabulario pessoal (cada maquina tem o seu; editavel pela aba Vocabulario)
 vocabulario.txt
 
+# correcoes de grafia pessoais (SOMAM ao correcoes.example.txt versionado)
+correcoes.txt
+
 # preferencias pessoais (aba Ajustes; cada maquina tem o seu)
 settings.json
 
