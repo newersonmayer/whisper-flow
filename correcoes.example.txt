@@ -49,6 +49,21 @@ Neverson => Newerson
 post-hog => PostHog
 post hog => PostHog
 
+# --- UI (auditado no historico inteiro em 10/08/2026: 2.698 ditados) ---
+# ⚠️ So entram formas COMPOSTAS. As versoes de uma palavra so foram TESTADAS e
+# REPROVADAS, porque a mesma palavra esta certa numa frase e errada na outra —
+# ambiguidade que regex nao resolve (e o passe de LLM resolve):
+#   "SQL => skill"       19 ocorrencias, 13 sao SQL de verdade ("executar SQL",
+#                        "prompt injection", "Postgres SQL")
+#   "draw => drawer"     11 ocorrencias, 3 sao o nome da biblioteca "Draw"
+#                        ("a biblioteca que se chama Draw, ela tem SVG")
+#   "pending => padding"  9 ocorrencias, 3 sao status de fila ("deixa pending,
+#                        leva pra fila de transcricao")
+draw lateral => drawer lateral
+SQL UIX => skill de UI/UX
+SQL de UI e UX => skill de UI/UX
+SQL de UI/UX => skill de UI/UX
+
 # --- Exemplos pra voce copiar no seu correcoes.txt ---
 # supa base => Supabase
 # next js => Next.js
