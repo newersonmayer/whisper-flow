@@ -76,12 +76,81 @@ já com a chave). Pronto.
   abrir é instantâneo, e **fechar a janela só esconde** — pra encerrar de verdade,
   rode `parar.bat`.
 
-## Palavras saindo erradas? Ensine o vocabulário
+## Palavras saindo erradas? Use a aba Palavras
 
-Se a transcrição troca termos seus (ex: "CLAUDE.md" virando "cloud.md"), abra o
-app **Transcrições → aba Vocabulário**, liste os nomes/siglas/jargões do seu dia a
-dia e clique **Salvar**. Esse texto vira contexto pra API em toda gravação — a
-próxima já sai certa, sem reinstalar nem reiniciar nada.
+Abra o app **Transcrições → aba Palavras**. Ela tem dois campos, e a diferença
+entre eles importa:
+
+| Campo | O que faz | Funciona sempre? |
+|---|---|---|
+| **Correções automáticas** | troca literal: `cloud.md => CLAUDE.md` | **Sim.** É uma substituição de texto, não depende do modelo |
+| **Termos do vocabulário** | manda a lista como contexto pra API | Não. É uma dica — o modelo acerta às vezes |
+
+Se um termo sai errado **toda vez**, ele tem que virar uma **correção**. Medimos
+isso em 23,5 min de fala real: com o termo só no vocabulário, "CLAUDE.md" saiu
+certo **0 vez em 8**; como correção, 8 de 8.
+
+Selecione o termo no campo de baixo e clique em **"Promover termo a correção"**
+para levá-lo pro campo de cima já no formato certo.
+
+Salvou, vale no próximo ditado — sem reiniciar nada.
+
+## Deixar o texto mais limpo (aba Formatação)
+
+Liga um passe que tira vícios de fala ("né", "tá", "tipo"), pontua, quebra em
+parágrafos e entende auto-correção falada — se você disse *"às 2… na verdade às
+3"*, fica só "às 3".
+
+Custa ~3 a 6 segundos a mais por ditado e roda **só acima do limiar de duração**
+que você escolher (padrão: 30s), porque em ditado curto a espera não compensa.
+Vem **desligado**.
+
+Se a API falhar, você recebe o texto sem tratamento — o passe nunca custa um
+ditado.
+
+## Instalar no macOS
+
+Funciona no macOS (Apple Silicon M1–M5 e Intel). O núcleo é o mesmo; o que muda
+por sistema está isolado no `plataforma.py`.
+
+```bash
+git clone https://github.com/newersonmayer/whisper-flow.git
+cd whisper-flow
+chmod +x instalar-macos.sh
+./instalar-macos.sh
+```
+
+O script cria o venv, instala as dependências (pulando as que são só do
+Windows), gera o `.env` e registra um **LaunchAgent** que sobe no login e
+religa sozinho se cair — o equivalente da Tarefa Agendada do Windows.
+
+### ⚠️ Dois passos manuais, sem os quais não funciona
+
+1. **Ajustes do Sistema → Privacidade e Segurança → Acessibilidade** — adicione
+   e marque o Terminal (ou o app que roda isto).
+   **Sem isso a hotkey simplesmente não dispara**, e não aparece erro nenhum:
+   o programa sobe normal e nunca recebe tecla. Parece bug, é permissão. O
+   `dictate.log` avisa quando detecta essa situação.
+2. **Ajustes do Sistema → Privacidade e Segurança → Microfone** — idem, para gravar.
+
+### Diferenças no Mac
+
+| | Windows | macOS |
+|---|---|---|
+| Hotkey padrão `alt_gr/ctrl_r` | Alt Gr ou Ctrl direito | **Option direito** ou Control direito |
+| Colar | Ctrl+V | **Cmd+V** (automático) |
+| Mão-livres | Ctrl+Alt+Espaço | igual |
+| Bipes | tons gerados | sons do sistema (Tink/Pop/Basso) |
+| Sobe no login | Tarefa Agendada | LaunchAgent (`launchctl`) |
+
+Para remover: `./instalar-macos.sh --remover` (não toca no seu `.env` nem nas
+transcrições).
+
+Conferir se subiu:
+
+```bash
+tail -5 dictate.log     # tem que aparecer: whisper-voice pronto (macOS)
+```
 
 ## Como fechar
 
