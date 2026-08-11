@@ -1,0 +1,38 @@
+# Preferencias de formatacao — como voce quer que o texto ditado saia.
+#
+# Isto NAO e o vocabulario. Sao coisas diferentes e resolvem problemas
+# diferentes:
+#
+#   vocabulario.txt  -> QUAIS PALAVRAS existem no seu mundo (nomes, siglas,
+#                       jargao). Serve pra grafia.
+#   correcoes.txt    -> troca literal e deterministica, sempre igual
+#                       ("cloud.md" vira "CLAUDE.md"). 0ms, nao erra.
+#   preferencias.txt -> COMO o texto deve ficar depois de transcrito: o que
+#                       tirar, como pontuar, como quebrar. Este arquivo.
+#
+# O passe de formatacao so roda se voce ligar na aba Ajustes do app, e so em
+# ditados acima do limiar que voce escolher la (ditado curto nao compensa a
+# espera). Se a API falhar, voce recebe o texto sem tratamento — nunca perde
+# o ditado.
+#
+# Escreva em linguagem natural, como se pedisse pra uma pessoa. Salvou, ja
+# vale no proximo ditado, sem reiniciar nada.
+#
+# Para preferencias so suas, crie um "preferencias.txt" ao lado deste arquivo
+# (ele nao vai pro git e SUBSTITUI este). Este .example e o padrao versionado.
+
+- Tire vicios de fala quando forem muleta: "ne", "ta", "tipo", "assim",
+  "entao", "no caso", "enfim". Se a palavra carregar sentido de verdade na
+  frase, mantenha.
+- Tire repeticoes e falsos comecos ("eu vou... eu vou fazer" vira "eu vou
+  fazer").
+- Se eu me corrigir falando ("as 2... na verdade as 3", "nao e Mistral, e
+  Mistica"), mantenha SO a versao final e descarte a errada.
+- Pontue de verdade: ponto final, virgula, interrogacao. Quebre em paragrafos
+  a cada mudanca de assunto.
+- Quando eu enumerar falando ("primeiro... segundo...", "um... dois..."),
+  transforme em lista com hifen.
+- Mantenha o meu tom. Eu falo informal e direto; nao deixe o texto corporativo
+  nem floreado.
+- Nao traduza termo tecnico em ingles (deploy, commit, branch, merge, drawer,
+  padding, race condition, rate limit). Eles ficam como estao.

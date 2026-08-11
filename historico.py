@@ -59,6 +59,12 @@ BASE = os.path.dirname(os.path.abspath(__file__))
 HIST_DIR = os.path.join(BASE, "transcricoes")
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")
 VOCAB_EXAMPLE = os.path.join(BASE, "vocabulario.example.txt")
+# Correcoes SOMAM (.example versionado + .txt local); vocabulario e preferencias
+# SUBSTITUEM (local ganha do .example). A tela deixa isso explicito no texto.
+CORRECOES_PATH = os.path.join(BASE, "correcoes.txt")
+CORRECOES_EXAMPLE = os.path.join(BASE, "correcoes.example.txt")
+PREFS_PATH = os.path.join(BASE, "preferencias.txt")
+PREFS_EXAMPLE = os.path.join(BASE, "preferencias.example.txt")
 SETTINGS_PATH = os.path.join(BASE, "settings.json")
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
 LINE_RE = re.compile(r"^- \*\*(\d{2}:\d{2}:\d{2})\*\* — (.*)$")
@@ -99,6 +105,12 @@ INK = "#E8E8EC"         # texto principal
 MUTE = "#8E8E96"        # texto secundário
 FAINT = "#6E6E76"       # texto apagado (hora, cabeçalho de dia)
 ORANGE = "#F2A33C"      # acento
+# Tokens da tela Palavras/Formatacao (ver .specs/#02-.../_estetica-veredito.md).
+# Hierarquia por LUMINANCIA, nao por sombra: o Qt nao tem box-shadow em QWidget.
+CARD1 = "#0E0E10"       # bloco primario (7% mais claro que o fundo)
+CARD2 = "#0A0A0B"       # bloco secundario (3%)
+DISABLED = "#7E7E86"    # texto de bloco desligado — 4,79:1, legivel de proposito
+DISABLED_HINT = "#5E5E66"
 
 # QSS só pros pedaços custom (o resto é o tema dark do QFluentWidgets)
 QSS = f"""
@@ -126,6 +138,38 @@ QSS = f"""
 #recBtn:disabled {{ background: #4A3B1E; color: #8E7B4F; }}
 #recBtn[recording="true"] {{ background: #D64545; color: #FFFFFF; }}
 #recBtn[recording="true"]:hover {{ background: #C03B3B; }}
+
+/* ---- blocos das telas Palavras e Formatacao ---- */
+#cardPrimario {{
+    background: {CARD1}; border: 1px solid rgba(255,255,255,0.10);
+    border-radius: 12px;
+}}
+#cardSecundario {{
+    background: {CARD2}; border: 1px solid rgba(255,255,255,0.06);
+    border-radius: 12px;
+}}
+#blocoTitulo {{ color: {INK}; font-size: 14px; font-weight: 600; }}
+#blocoTituloSec {{ color: #C9C9CE; font-size: 13.5px; font-weight: 500; }}
+
+/* Chips: a diferenca e PESO (preenchido x contorno), nao matiz. Semaforo
+   verde/vermelho grita em tema quase-preto e sugere "erro" onde o certo e
+   "mais fraco" — a dica nao esta errada, ela so nao e garantida. */
+#chipGarantia {{
+    color: {ORANGE}; background: rgba(242,163,60,0.14);
+    border: 1px solid rgba(242,163,60,0.38); border-radius: 9px;
+    font-size: 10.5px; font-weight: 600; padding: 2px 8px;
+}}
+#chipDica {{
+    color: {MUTE}; background: transparent;
+    border: 1px solid rgba(255,255,255,0.14); border-radius: 9px;
+    font-size: 10.5px; font-weight: 500; padding: 2px 8px;
+}}
+
+/* Desabilitado = MENOS CONTRASTE, nunca opacity: opacity apaga a borda junto e
+   o bloco vira mancha. O usuario precisa LER as preferencias pra decidir ligar. */
+QWidget:disabled #blocoTitulo,
+QWidget:disabled #body {{ color: {DISABLED}; }}
+QWidget:disabled #hint {{ color: {DISABLED_HINT}; }}
 """
 
 
@@ -213,6 +257,41 @@ def read_vocab():
         except OSError:
             continue
     return ""
+
+
+def load_texto(path, exemplo, default=""):
+    """Le o arquivo local; se nao existir/estiver vazio, cai no .example
+    versionado. Mesma regra do dictate.py."""
+    for p in (path, exemplo):
+        try:
+            with open(p, encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt
+        except OSError:
+            continue
+    return default
+
+
+def salvar_texto(path, texto):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(texto.strip() + "\n")
+
+
+def contar_regras(texto):
+    """(validas, ignoradas) — mesma leitura do _parse_correcoes do dictate.py.
+    Linha sem '=>' e ignorada em SILENCIO la; aqui a gente conta e avisa, senao
+    o usuario digita errado e acha que salvou."""
+    validas = ignoradas = 0
+    for linha in (texto or "").splitlines():
+        linha = linha.split("#", 1)[0].strip()
+        if not linha:
+            continue
+        if "=>" in linha and linha.split("=>", 1)[0].strip():
+            validas += 1
+        else:
+            ignoradas += 1
+    return validas, ignoradas
 
 
 def load_settings():
@@ -705,53 +784,301 @@ class HistPanel(QWidget):
                 pass
         QTimer.singleShot(ms, reset)
 
-class VocabPanel(QWidget):
-    """Tela Vocabulário — o prompt que a API recebe em toda transcrição."""
+def _chip(texto, garantia):
+    lab = QLabel(texto)
+    lab.setObjectName("chipGarantia" if garantia else "chipDica")
+    return lab
+
+
+def _bloco(titulo, chip_txt, chip_garantia, descricao, primario):
+    """Card com titulo + chip + descricao. Devolve (card, layout_do_conteudo)
+    pra quem chama empilhar o editor e os botoes."""
+    card = QFrame()
+    card.setObjectName("cardPrimario" if primario else "cardSecundario")
+    v = QVBoxLayout(card)
+    v.setContentsMargins(18, 16, 18, 16)
+    v.setSpacing(8)
+
+    topo = QHBoxLayout()
+    topo.setSpacing(8)
+    t = QLabel(titulo)
+    t.setObjectName("blocoTitulo" if primario else "blocoTituloSec")
+    topo.addWidget(t)
+    topo.addWidget(_chip(chip_txt, chip_garantia))
+    topo.addStretch(1)
+    v.addLayout(topo)
+
+    d = QLabel(descricao)
+    d.setObjectName("hint")
+    d.setWordWrap(True)
+    v.addWidget(d)
+    return card, v
+
+
+class PalavrasPanel(QWidget):
+    """Tela Palavras — as duas alavancas de grafia, na ordem da EFICACIA real.
+
+    Correcoes vem PRIMEIRO de proposito. Ate 10/08/2026 esta tela era so
+    "Vocabulario", e o vocabulario e a alavanca FRACA: ele vira o `prompt` da
+    API de transcricao, que o modelo ignora — medido em 23,5 min de fala real,
+    "CLAUDE.md" saiu certo 0 vez em 8, "Isaque" 0 em 4. Quem funciona e o
+    passe de regex (correcoes.txt), que acertou 14 de 14 e nao tinha tela
+    nenhuma. Colocar a alavanca morta em destaque e prometer um resultado que
+    o mecanismo nao entrega."""
 
     def __init__(self):
         super().__init__()
-        self.setObjectName("vocabPage")
+        self.setObjectName("palavrasPage")
         self.setStyleSheet(QSS)
         v = QVBoxLayout(self)
         v.setContentsMargins(28, 24, 28, 24)
-        v.setSpacing(12)
+        v.setSpacing(14)
 
-        title = QLabel("Vocabulário")
+        title = QLabel("Palavras")
         title.setObjectName("pageTitle")
         v.addWidget(title)
 
-        hint = QLabel(
-            "Nomes, siglas e jargões que a transcrição costuma errar (ex: CLAUDE.md "
-            "virando \"cloud.md\"). Esse texto é enviado como contexto pra API em toda "
-            "gravação — do atalho de teclado e da tela Gravar. Salvou, valeu: a próxima "
-            "gravação já usa, sem reiniciar nada."
-        )
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        v.addWidget(hint)
+        sub = QLabel("Termos que a transcrição erra.")
+        sub.setObjectName("hint")
+        v.addWidget(sub)
 
-        self.editor = PlainTextEdit()
-        self.editor.setPlainText(load_vocab_editor())
-        v.addWidget(self.editor, 1)
+        # ---- bloco 1 (PRIMARIO): correcoes — a que funciona ----
+        card1, c1 = _bloco(
+            "Correções automáticas", "garantia", True,
+            "Uma por linha, no formato  errado => certo.  Troca literal, "
+            "sempre — não depende do modelo acertar. A ordem importa: do mais "
+            "específico pro mais genérico.", primario=True)
+        self.ed_corr = PlainTextEdit()
+        self.ed_corr.setPlainText(load_texto(CORRECOES_PATH, CORRECOES_EXAMPLE))
+        self.ed_corr.setPlaceholderText(
+            "cloud.md => CLAUDE.md\nisaac => Isaque")
+        c1.addWidget(self.ed_corr, 1)
+        r1 = QHBoxLayout()
+        self.lbl_corr = QLabel("")
+        self.lbl_corr.setObjectName("hint")
+        r1.addWidget(self.lbl_corr)
+        r1.addStretch(1)
+        b1 = PrimaryPushButton(FluentIcon.SAVE, "Salvar correções")
+        b1.setCursor(Qt.PointingHandCursor)
+        b1.clicked.connect(self.salvar_correcoes)
+        r1.addWidget(b1)
+        c1.addLayout(r1)
+        v.addWidget(card1, 3)
 
-        row = QHBoxLayout()
-        row.addStretch(1)
-        self.save_btn = PrimaryPushButton(FluentIcon.SAVE, "Salvar")
-        self.save_btn.setCursor(Qt.PointingHandCursor)
-        self.save_btn.clicked.connect(self.save)
-        row.addWidget(self.save_btn)
-        v.addLayout(row)
+        # ---- bloco 2 (SECUNDARIO): vocabulario — a dica ----
+        card2, c2 = _bloco(
+            "Termos do meu vocabulário", "dica", False,
+            "Nomes e jargões do seu dia a dia. Isto é uma dica pro modelo, "
+            "não garantia — ele acerta às vezes. Se um termo sai errado toda "
+            "vez, use o botão abaixo pra promovê-lo a correção.", primario=False)
+        self.ed_vocab = PlainTextEdit()
+        self.ed_vocab.setPlainText(load_vocab_editor())
+        c2.addWidget(self.ed_vocab, 1)
+        r2 = QHBoxLayout()
+        prom = TransparentPushButton(FluentIcon.UP, "Promover termo a correção")
+        prom.setCursor(Qt.PointingHandCursor)
+        prom.clicked.connect(self.promover)
+        r2.addWidget(prom)
+        r2.addStretch(1)
+        b2 = PushButton(FluentIcon.SAVE, "Salvar vocabulário")
+        b2.setCursor(Qt.PointingHandCursor)
+        b2.clicked.connect(self.salvar_vocab)
+        r2.addWidget(b2)
+        c2.addLayout(r2)
+        v.addWidget(card2, 2)
 
-    def save(self):
+        self._atualiza_contagem()
+        self.ed_corr.textChanged.connect(self._atualiza_contagem)
+
+    def _atualiza_contagem(self):
+        ok, ign = contar_regras(self.ed_corr.toPlainText())
+        txt = f"{ok} regra{'s' if ok != 1 else ''}"
+        if ign:
+            txt += f" · {ign} linha{'s' if ign != 1 else ''} sem \"=>\" (ignorada)"
+        self.lbl_corr.setText(txt)
+
+    def promover(self):
+        """Leva o termo selecionado no vocabulario pro editor de correcoes, ja
+        no formato. Fecha o ciclo 'vi errando -> viro garantia' sem redigitar —
+        e o equivalente manual do auto-add do Wispr Flow (o app nao enxerga o
+        campo onde colou, entao nao da pra detectar a correcao sozinho)."""
+        termo = (self.ed_vocab.textCursor().selectedText() or "").strip()
+        if not termo:
+            InfoBar.warning("Selecione um termo",
+                            "Marque a palavra no vocabulário e clique de novo.",
+                            parent=self, position=InfoBarPosition.TOP_RIGHT,
+                            duration=3000)
+            return
+        atual = self.ed_corr.toPlainText().rstrip()
+        self.ed_corr.setPlainText(f"{atual}\ncomo sai errado => {termo}".strip())
+        InfoBar.success("Termo copiado",
+                        f"Escreva à esquerda como \"{termo}\" costuma sair errado.",
+                        parent=self, position=InfoBarPosition.TOP_RIGHT,
+                        duration=4000)
+
+    def salvar_correcoes(self):
+        ok, ign = contar_regras(self.ed_corr.toPlainText())
         try:
-            with open(VOCAB_PATH, "w", encoding="utf-8") as f:
-                f.write(self.editor.toPlainText().strip() + "\n")
+            salvar_texto(CORRECOES_PATH, self.ed_corr.toPlainText())
+        except Exception as ex:
+            InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
+                          position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        msg = f"{ok} regra{'s' if ok != 1 else ''} ativa{'s' if ok != 1 else ''}."
+        if ign:
+            msg += f" {ign} linha sem \"=>\" foi ignorada."
+        msg += " Já vale no próximo ditado."
+        (InfoBar.warning if ign else InfoBar.success)(
+            "Correções salvas", msg, parent=self,
+            position=InfoBarPosition.TOP_RIGHT, duration=4000 if ign else 3000)
+
+    def salvar_vocab(self):
+        try:
+            salvar_texto(VOCAB_PATH, self.ed_vocab.toPlainText())
         except Exception as ex:
             InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
                           position=InfoBarPosition.TOP_RIGHT, duration=4000)
             return
         InfoBar.success("Vocabulário salvo",
                         "Já vale a partir da próxima gravação — sem reiniciar nada.",
+                        parent=self, position=InfoBarPosition.TOP_RIGHT, duration=3000)
+
+
+class FormatacaoPanel(QWidget):
+    """Tela Formatação — o passe de LLM que limpa o texto depois de transcrever.
+
+    O liga/desliga e o limiar moram AQUI, nao em Ajustes: separar o interruptor
+    da coisa que ele liga obriga o usuario a percorrer duas telas pra uma
+    decisao so. Ajustes fica com o que e transversal (clipboard, popup)."""
+
+    def __init__(self):
+        super().__init__()
+        self.setObjectName("formatPage")
+        self.setStyleSheet(QSS)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(28, 24, 28, 24)
+        v.setSpacing(14)
+
+        title = QLabel("Formatação")
+        title.setObjectName("pageTitle")
+        v.addWidget(title)
+
+        sub = QLabel("Depois de transcrever, limpar e organizar o texto.")
+        sub.setObjectName("hint")
+        v.addWidget(sub)
+
+        # ---- interruptor (primario) ----
+        card, c = _bloco(
+            "Organizar o texto automaticamente", "usa IA", True,
+            "Tira vícios de fala, pontua e quebra em parágrafos, seguindo as "
+            "suas preferências abaixo. Custa ~3 a 6 segundos a mais por ditado. "
+            "Se a API falhar, você recebe o texto sem tratamento — nunca perde "
+            "o ditado.", primario=True)
+        linha = QHBoxLayout()
+        linha.addStretch(1)
+        self.sw = SwitchButton()
+        self.sw.setChecked(load_settings().get("normalizar_enabled", False))
+        self.sw.checkedChanged.connect(self._toggle)
+        linha.addWidget(self.sw)
+        c.addLayout(linha)
+        v.addWidget(card)
+
+        # ---- daqui pra baixo: desabilita junto com o toggle ----
+        self.dependentes = QWidget()
+        dv = QVBoxLayout(self.dependentes)
+        dv.setContentsMargins(0, 0, 0, 0)
+        dv.setSpacing(14)
+
+        card_lim, cl = _bloco(
+            "Só em ditados longos", "", False,
+            "Ditado curto não compensa a espera. No seu histórico, 58% têm "
+            "menos de 30 segundos — mas os longos concentram 81% de tudo que "
+            "você fala.", primario=False)
+        rl = QHBoxLayout()
+        rl.setSpacing(8)
+        lab = QLabel("Rodar só acima de")
+        lab.setObjectName("body")
+        rl.addWidget(lab)
+        self.spin = SearchLineEdit()
+        self.spin.setPlaceholderText("30")
+        self.spin.setText(str(load_settings().get("normalizar_min_seg", 30)))
+        self.spin.setFixedWidth(90)
+        self.spin.setClearButtonEnabled(False)
+        self.spin.searchSignal.connect(lambda _: self._salvar_limiar())
+        self.spin.editingFinished.connect(self._salvar_limiar)
+        rl.addWidget(self.spin)
+        seg = QLabel("segundos de fala")
+        seg.setObjectName("body")
+        rl.addWidget(seg)
+        rl.addStretch(1)
+        cl.addLayout(rl)
+        dv.addWidget(card_lim)
+
+        card_pref, cp = _bloco(
+            "Como eu quero o texto", "", False,
+            "Escreva em português normal, como se pedisse pra uma pessoa. "
+            "Salvou, já vale no próximo ditado.", primario=False)
+        self.ed = PlainTextEdit()
+        self.ed.setPlainText(load_texto(PREFS_PATH, PREFS_EXAMPLE))
+        cp.addWidget(self.ed, 1)
+        rp = QHBoxLayout()
+        rp.addStretch(1)
+        bp = PrimaryPushButton(FluentIcon.SAVE, "Salvar preferências")
+        bp.setCursor(Qt.PointingHandCursor)
+        bp.clicked.connect(self.salvar)
+        rp.addWidget(bp)
+        cp.addLayout(rp)
+        dv.addWidget(card_pref, 1)
+
+        v.addWidget(self.dependentes, 1)
+        # desabilitado (nao escondido): o usuario precisa LER o que vai ganhar
+        # antes de decidir ligar. Esconder faz a feature parecer inexistente.
+        self.dependentes.setEnabled(self.sw.isChecked())
+
+    def _toggle(self, checked):
+        self.dependentes.setEnabled(bool(checked))
+        try:
+            save_setting("normalizar_enabled", bool(checked))
+        except Exception as ex:
+            self.sw.setChecked(not checked)   # reverte se nao gravou
+            InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
+                          position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        InfoBar.success(
+            "Formatação ligada" if checked else "Formatação desligada",
+            "Já vale no próximo ditado." if checked
+            else "Os ditados voltam a ser colados como saem da transcrição.",
+            parent=self, position=InfoBarPosition.TOP_RIGHT, duration=2500)
+
+    def _salvar_limiar(self):
+        txt = (self.spin.text() or "").strip()
+        try:
+            seg = int(float(txt))
+            if seg < 0:
+                raise ValueError
+        except ValueError:
+            self.spin.setText(str(load_settings().get("normalizar_min_seg", 30)))
+            InfoBar.warning("Valor inválido", "Use um número de segundos (ex: 30).",
+                            parent=self, position=InfoBarPosition.TOP_RIGHT,
+                            duration=3000)
+            return
+        try:
+            save_setting("normalizar_min_seg", seg)
+        except Exception as ex:
+            InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
+                          position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        InfoBar.success("Limiar salvo", f"Só ditados acima de {seg}s são organizados.",
+                        parent=self, position=InfoBarPosition.TOP_RIGHT, duration=2500)
+
+    def salvar(self):
+        try:
+            salvar_texto(PREFS_PATH, self.ed.toPlainText())
+        except Exception as ex:
+            InfoBar.error("Falhou ao salvar", str(ex)[:120], parent=self,
+                          position=InfoBarPosition.TOP_RIGHT, duration=4000)
+            return
+        InfoBar.success("Preferências salvas", "Já valem no próximo ditado.",
                         parent=self, position=InfoBarPosition.TOP_RIGHT, duration=3000)
 
 
@@ -839,14 +1166,17 @@ class MainWindow(FluentWindow):
 
         self.hist = HistPanel()
         self.record = RecordPanel(on_saved=self.hist.reload)
-        self.vocab = VocabPanel()
+        self.vocab = PalavrasPanel()
+        self.formatacao = FormatacaoPanel()
         # isTransparent: sem o painel cinza da lib — o conteudo mostra o fundo
         # quase-preto da janela
         self.addSubInterface(self.hist, FluentIcon.HISTORY, "Histórico",
                              isTransparent=True)
         self.addSubInterface(self.record, FluentIcon.MICROPHONE, "Gravar",
                              isTransparent=True)
-        self.addSubInterface(self.vocab, FluentIcon.DICTIONARY, "Vocabulário",
+        self.addSubInterface(self.vocab, FluentIcon.DICTIONARY, "Palavras",
+                             isTransparent=True)
+        self.addSubInterface(self.formatacao, FluentIcon.FONT, "Formatação",
                              isTransparent=True)
         self.settings = SettingsPanel()
         self.addSubInterface(self.settings, FluentIcon.SETTING, "Ajustes",

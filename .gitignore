@@ -20,6 +20,9 @@ vocabulario.txt
 # correcoes de grafia pessoais (SOMAM ao correcoes.example.txt versionado)
 correcoes.txt
 
+# preferencias de formatacao pessoais (SUBSTITUEM o preferencias.example.txt)
+preferencias.txt
+
 # preferencias pessoais (aba Ajustes; cada maquina tem o seu)
 settings.json
 

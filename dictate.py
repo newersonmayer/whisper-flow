@@ -148,6 +148,13 @@ API_RETRIES = 3
 BLOCK = 320           # 20ms por bloco -> ~50 updates/s (onda fluida)
 N_POINTS = 56
 MUTE_WHILE_RECORDING = True   # silencia a saida de audio enquanto grava
+# Quanto tempo o InputStream fica ABERTO depois do ultimo ditado. Abrir o
+# dispositivo a frio custa ate 5s (medido no dictate.log: 7,4% dos ditados
+# passavam de 1s so pra abrir); mantendo o stream quente, o ditado seguinte
+# comeca em ~0ms. Custo: o indicador de "microfone em uso" do Windows fica aceso
+# nesse intervalo. 0 = fecha na hora (comportamento antigo); numero alto = sempre
+# ligado. Ajustavel pelo .env sem mexer no codigo.
+MIC_WARM_S = float(os.getenv("MIC_WARM_SECONDS", "180"))
 LOG_PATH = os.path.join(BASE, "dictate.log")
 HIST_DIR = os.path.join(BASE, "transcricoes")
 PEND_DIR = os.path.join(BASE, "pendentes")   # audios salvos antes de transcrever (sobrevivem a quedas)
@@ -163,6 +170,15 @@ CORRECOES_PATH = os.path.join(BASE, "correcoes.txt")
 CORRECOES_EXAMPLE = os.path.join(BASE, "correcoes.example.txt")
 SETTINGS_PATH = os.path.join(BASE, "settings.json")          # preferencias da aba Ajustes
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
+# Passe de normalizacao (ver normalizar_texto): tira vicio de fala, pontua e
+# quebra em paragrafos, conforme o preferencias.txt. Roda DEPOIS do
+# corrigir_termos, e so quando o usuario liga na aba Ajustes.
+PREFS_PATH = os.path.join(BASE, "preferencias.txt")            # editavel pela UI
+PREFS_EXAMPLE = os.path.join(BASE, "preferencias.example.txt")
+NORMALIZE_MODEL = os.getenv("NORMALIZE_MODEL", "gpt-5.6-luna")
+# Teto de espera do passe. Estourou, cola o texto de hoje: o passe e um bonus,
+# nunca pode custar um ditado (ver o fail-open no normalizar_texto).
+NORMALIZE_TIMEOUT_S = float(os.getenv("NORMALIZE_TIMEOUT", "20"))
 # Ping periodico + keep-alive de 120s no pool: com ping a cada 90s a MESMA
 # conexao TLS e reusada em toda transcricao (o default do httpx expira o
 # keep-alive em 5s, entao o ping antigo de 4min nao reusava nada — cada ditado
@@ -185,12 +201,17 @@ popup = None
 
 _frames = []
 _stream = None
-_recording = False
+_recording = False   # estado LOGICO: o usuario mandou gravar (vira True na hora)
+_capturing = False   # estado FISICO: o callback do PortAudio esta acumulando frames
 _last_level = 0.0
-_state_lock = threading.Lock()
+_state_lock = threading.Lock()    # protege _recording/_rec_mode
+_capture_lock = threading.Lock()  # serializa begin/end do dispositivo
+_stream_lock = threading.Lock()   # protege abrir/fechar o _stream
+_warm_until = 0.0                 # ate quando o stream fica aberto ocioso
 _pressed = set()   # teclas atualmente pressionadas (so a thread do listener mexe)
 _t_press = None    # perf_counter do apertar da tecla -> mede tecla->overlay
 _rec_mode = None   # None | "hold" | "handsfree" — quem esta gravando agora
+_hold_combo_active = False       # True enquanto a HOTKEY do hold esta pressionada (anti-repeat)
 _handsfree_combo_active = False  # True enquanto o chord maos-livres esta 100% pressionado (anti-repeat)
 _hf_target_hwnd = None           # janela em foco quando o atalho maos-livres foi apertado (pro auto-paste)
 
@@ -394,6 +415,119 @@ def corrigir_termos(texto):
     return texto
 
 
+def read_prefs():
+    """Preferencias de formatacao (o que o usuario quer que o passe faca).
+    Lidas a cada ditado — salvou na UI, ja vale na proxima, sem reiniciar.
+    Sem preferencias.txt, cai no .example versionado."""
+    for path in (PREFS_PATH, PREFS_EXAMPLE):
+        try:
+            with open(path, encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt[:4000]
+        except OSError:
+            continue
+    return ""
+
+
+# ⚠️ A regra "na duvida NAO troque" nao e enfeite: sem ela, medido em
+# 10/08/2026 com 4 rodadas por variante, o modelo trocou um apelido que nao
+# conhecia ("Gudoce") por um termo do glossario ("Claude Code") em ate 3 de 4
+# rodadas — ou seja, INVENTOU uma correcao e mudou o sentido da fala. Com a
+# regra, 4/4 preservaram a palavra original. Se for mexer neste prompt,
+# re-rode o teste antes: uma rodada so nao pega alucinacao intermitente.
+_NORM_SYS = """Você limpa transcrições de ditado de voz em português do Brasil.
+Devolva SOMENTE o texto tratado — sem preâmbulo, sem comentário, sem markdown,
+sem responder ao conteúdo. Você NÃO é um assistente: você é um filtro de texto.
+
+REGRAS
+1. GLOSSÁRIO — corrija para estas grafias exatas quando o texto trouxer algo
+   foneticamente parecido:
+{vocab}
+
+⚠️ REGRA 1-B (a mais importante): na dúvida, NÃO troque.
+   Só aplique o glossário quando a palavra do texto for claramente a MESMA
+   palavra escrita errado (ex: "cloud.md" -> "CLAUDE.md", "Isaac" -> "Isaque").
+   Se encontrar uma palavra que NÃO reconhece e que NÃO é obviamente um termo
+   do glossário grafado errado, MANTENHA-A EXATAMENTE COMO ESTÁ. Nunca
+   substitua uma palavra desconhecida por um termo do glossário "no chute" —
+   inventar uma correção é pior do que deixar a palavra original.
+
+2. NÃO resuma, NÃO encurte ideias, NÃO invente, NÃO responda. Preserve TODO o
+   conteúdo e o tom de quem fala.
+
+PREFERÊNCIAS DE QUEM DITOU (siga à risca)
+{prefs}"""
+
+
+def vai_normalizar(duracao):
+    """O passe vai rodar neste ditado? Existe separado do normalizar_texto
+    porque a PILL precisa saber ANTES: mostrar "organizando" num ditado que
+    nao sera organizado e mentir sobre o estado — o mesmo defeito da tela que
+    prometia vocabulario e nao entregava."""
+    if not read_setting("normalizar_enabled", False):
+        return False
+    try:
+        minimo = float(read_setting("normalizar_min_seg", 30))
+    except (TypeError, ValueError):
+        minimo = 30.0
+    if duracao < minimo:
+        return False
+    return bool(read_prefs())
+
+
+def normalizar_texto(texto, duracao):
+    """Passe de formatacao pos-transcricao: tira vicio de fala, pontua, quebra
+    em paragrafos — conforme o preferencias.txt. Devolve o texto tratado, ou o
+    ORIGINAL se qualquer coisa der errado.
+
+    FAIL-OPEN por decisao: este passe e um bonus sobre um texto que ja esta
+    pronto e correto. Erro de API, timeout, resposta vazia ou modelo sem acesso
+    NAO podem custar o ditado — o precedente e o guard anti-eco de jul/2026,
+    que engoliu 12 ditados por poder devolver vazio.
+
+    So roda quando o usuario ligou na aba Ajustes E o audio passou do limiar:
+    ditado curto ("pode seguir") nao compensa a espera — medido em 10/08/2026,
+    58% dos ditados tem menos de 30s, mas os >=30s concentram 81% do audio
+    falado. O limiar pega quase todo o ganho pagando espera em menos da metade.
+    """
+    if not texto or not vai_normalizar(duracao):
+        return texto
+    prefs = read_prefs()
+    try:
+        t0 = time.perf_counter()
+        r = client.chat.completions.create(
+            model=NORMALIZE_MODEL,
+            messages=[
+                {"role": "system", "content": _NORM_SYS.format(
+                    vocab=read_vocab() or "(sem glossário)", prefs=prefs)},
+                {"role": "user", "content": texto},
+            ],
+            # 'low' porque o passe e reescrita, nao raciocinio: cortou 26% da
+            # latencia (7,2s -> 5,3s) sem perder qualidade, uma vez que a regra
+            # 1-B esta no prompt. 'minimal' nao e suportado por este modelo.
+            reasoning_effort="low",
+            timeout=NORMALIZE_TIMEOUT_S,
+        )
+        novo = (r.choices[0].message.content or "").strip()
+        ms = (time.perf_counter() - t0) * 1000
+        if not novo:
+            log("[norm] resposta vazia; mantendo o texto original")
+            return texto
+        # guarda contra o modelo resumir apesar da regra 2. Abaixo de 55% do
+        # tamanho nao e limpeza de vicio de fala, e perda de conteudo — medido:
+        # o passe saudavel devolve 87-96% do original.
+        if len(novo) < len(texto) * 0.55:
+            log(f"[norm] saida com {len(novo)}/{len(texto)} chars "
+                f"({len(novo)/len(texto):.0%}); parece resumo — descartando")
+            return texto
+        log(f"[t] normalizar {ms:.0f}ms | {len(texto)} -> {len(novo)} chars")
+        return novo
+    except Exception as e:
+        log(f"[norm] falhou ({str(e)[:90]}); mantendo o texto original")
+        return texto
+
+
 _warmup_busy = threading.Lock()
 
 
@@ -503,6 +637,8 @@ class Bridge(QObject):
     handsfree_cancel = pyqtSignal()   # ESC: descarta sem transcrever
     handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
     popup = pyqtSignal(str, float)    # (texto, segundos) -> ResultPopup (thread da UI)
+    abort = pyqtSignal(str)   # modo cuja captura falhou -> esconde a pill NA thread da UI
+    normalizing = pyqtSignal(str)   # modo que entrou na fase 2 (pill "organizando")
 
 
 def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
@@ -526,9 +662,51 @@ def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
         p.drawArc(QRect(15, int(cy - 6), 12, 12), -ang * 16, 110 * 16)
         dots = "." * (int(time.time() * 2.5) % 4)
         p.setPen(QColor("#C9C9CE"))
-        p.setFont(QFont("Segoe UI", 9))
-        p.drawText(QRect(36, 0, w - 48, h), Qt.AlignVCenter | Qt.AlignLeft,
+        # 8pt, nao 9pt: medido em 10/08/2026, "transcrevendo..." a 9pt ocupa
+        # 208px e este QRect tem 192px — o texto vinha sendo CORTADO em todo
+        # ditado. A 8pt sao 176px e sobra folga.
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(QRect(36, 0, w - 46, h), Qt.AlignVCenter | Qt.AlignLeft,
                    f"transcrevendo{dots}")
+        return
+    if mode == "norm":
+        # Fase 2 do passe de formatacao. A transcricao JA terminou — marcar
+        # como concluida (check, cinza, recuada) e o que faz os ~3-6s extras
+        # nao parecerem travamento: comunica que o essencial deu certo e falta
+        # so o polimento. E e literalmente verdade, porque o passe e fail-open.
+        #
+        # ⚠️ Layout definido por MEDICAO com QFontMetrics, nao por estimativa —
+        # a primeira versao desta pill usava a palavra "✓ transcrito" como
+        # TEXTO e estourava 134px: a 8pt ela sozinha ocupa 132px dos 217px
+        # uteis. O check DESENHADO custa 11px e diz a mesma coisa.
+        # Medido (217px uteis a partir de x=13):
+        #   check + arco + "organizando..." 8pt = 192px  <- esta versao
+        #   check + arco + "organizando..." 9pt = 220px  (estoura)
+        #   "✓ transcrito" 8pt + arco + texto   = 339px  (estoura feio)
+        x = 13
+        # check da fase concluida: cinza recuado, porque o trabalho essencial
+        # JA terminou — e o passe e fail-open, entao esse texto esta garantido
+        # mesmo se o que vem a seguir falhar.
+        pen = QPen(QColor("#6E6E76"), 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawLine(x, int(cy), x + 3, int(cy) + 4)
+        p.drawLine(x + 3, int(cy) + 4, x + 10, int(cy) - 4)
+        x += 20
+        # arco no LARANJA do acento (o busy e cinza): marca que agora e a etapa
+        # opcional, a que usa IA. Mesma cor do botao primario e do chip
+        # "garantia" — o acento significa consistentemente "a parte ativa".
+        ang = int((time.time() * 320) % 360)
+        pen = QPen(QColor("#F2A33C"), 2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(QRect(x, int(cy - 5.5), 11, 11), -ang * 16, 110 * 16)
+        x += 18
+        dots = "." * (int(time.time() * 2.5) % 4)
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor("#C9C9CE"))
+        p.drawText(QRect(x, 0, max(10, w - x - 8), h),
+                   Qt.AlignVCenter | Qt.AlignLeft, f"organizando{dots}")
         return
     if mode in ("done", "fail"):
         ok = mode == "done"
@@ -636,6 +814,11 @@ class Overlay(QWidget):
         log(f"[diag] updates={self._n} maxlvl={self._max:.3f} "
             f"visible={self.isVisible()} geo={self.x()},{self.y()} {self.width()}x{self.height()}")
         self.mode = "busy"   # repaint continua rodando: anima o spinner
+        self.update()
+
+    def show_norm(self):
+        """Fase 2: transcricao pronta, passe de formatacao rodando."""
+        self.mode = "norm"
         self.update()
 
     def show_done(self, secs):
@@ -756,6 +939,10 @@ class HandsFreeWindow(QWidget):
     def show_busy(self):
         self.mode = "busy"
         self.btn.hide()   # transcrevendo: nao ha o que parar
+        self.update()
+
+    def show_norm(self):
+        self.mode = "norm"
         self.update()
 
     def show_done(self, secs):
@@ -976,49 +1163,114 @@ def _focus_and_paste(text, hwnd):
     paste(text)
 
 
-def _begin_capture():
-    """Abre o stream, muta, warmup, beep. Seta _recording. Retorna False se ja
-    grava (miolo compartilhado entre hold-to-talk e maos-livres)."""
-    global _recording, _stream, _frames, _last_level
-    with _state_lock:
-        if _recording:
+def _audio_callback(indata, frames_count, time_info, status):
+    """Roda na thread do PortAudio. Com o stream persistente ele fica vivo mesmo
+    fora do ditado — por isso so acumula quando _capturing esta ligado."""
+    global _last_level
+    if not _capturing:
+        return
+    _frames.append(indata.copy())
+    rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2))) / 32768.0
+    _last_level = min(1.0, rms * 70.0)   # ganho p/ a onda encher (fala ~0.005-0.02)
+
+
+def _ensure_stream():
+    """Abre o InputStream se preciso. BLOQUEIA (dispositivo frio leva ate 5s) —
+    NUNCA chamar da thread da UI: era exatamente isso que congelava a pill."""
+    global _stream, _warm_until
+    with _stream_lock:
+        if _stream is not None:
+            try:
+                if _stream.active:
+                    return True
+            except Exception:
+                pass
+            # stream morto (mic trocado/desconectado): descarta e reabre
+            try:
+                _stream.stop()
+                _stream.close()
+            except Exception:
+                pass
+            _stream = None
+        try:
+            t0 = time.perf_counter()
+            s = sd.InputStream(samplerate=SR, channels=1, dtype="int16",
+                               blocksize=BLOCK, callback=_audio_callback)
+            s.start()
+            _stream = s
+            _warm_until = time.time() + MIC_WARM_S   # o keeper so fecha depois disso
+            ms = (time.perf_counter() - t0) * 1000
+            if ms > 300:
+                log(f"[t] abrir microfone {ms:.0f}ms (estava frio)")
+            return True
+        except Exception as e:
+            log(f"abrir microfone falhou: {e}")
+            _stream = None
             return False
+
+
+def _close_stream():
+    global _stream
+    with _stream_lock:
+        s, _stream = _stream, None
+    if s is None:
+        return
+    try:
+        s.stop()
+        s.close()
+    except Exception:
+        pass
+
+
+def _stream_keeper():
+    """Fecha o microfone depois de MIC_WARM_S ocioso. Mantendo-o quente entre
+    ditados proximos, o proximo start custa ~0ms em vez de ate 5s."""
+    while True:
+        time.sleep(5)
+        try:
+            if _stream is not None and not _capturing and time.time() > _warm_until:
+                _close_stream()
+        except Exception:
+            pass
+
+
+def _begin_capture():
+    """Liga a captura. BLOQUEIA enquanto abre o dispositivo — roda sempre numa
+    thread, nunca na da UI. Retorna False se o microfone nao abriu."""
+    global _frames, _last_level, _capturing, _warm_until
+    with _capture_lock:
+        warmup_api(quiet=True)   # esquenta a conexao ENQUANTO o usuario fala
+        if not _ensure_stream():
+            return False
+        # ditado curtissimo: a tecla pode ter sido solta enquanto o dispositivo
+        # abria. Nao liga uma captura orfa — o _end_capture dela ja passou.
+        if not _recording:
+            return False
+        beep(880)   # so apita quando a captura de fato comecou
         _frames = []
-        _recording = True
-    _last_level = 0.0
-    warmup_api(quiet=True)   # esquenta a conexao ENQUANTO o usuario fala
-    beep(880)
-
-    def callback(indata, frames_count, time_info, status):
-        global _last_level
-        _frames.append(indata.copy())
-        rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2))) / 32768.0
-        _last_level = min(1.0, rms * 70.0)   # ganho p/ a onda encher (fala ~0.005-0.02)
-
-    _stream = sd.InputStream(
-        samplerate=SR, channels=1, dtype="int16", blocksize=BLOCK, callback=callback
-    )
-    _stream.start()
-    mute_system()
+        _last_level = 0.0
+        _warm_until = time.time() + MIC_WARM_S
+        _capturing = True
+        # mute/unmute DENTRO do lock: os dois sao spawn nao-bloqueante, e o par
+        # so fecha certo se for serializado. Fora dele, um unmute podia chegar
+        # antes do mute (_muted_by_us vira no-op) e o PC ficava mudo pra sempre.
+        mute_system()
     return True
 
 
 def _end_capture():
-    """Fecha o stream, desmuta, beep. Retorna os frames por valor (evita a race
-    do _frames global). None se nao estava gravando."""
-    global _recording, _stream, _frames
-    with _state_lock:
-        if not _recording:
-            return None
-        _recording = False
-    try:
-        _stream.stop()
-        _stream.close()
-    except Exception:
-        pass
-    unmute_system()
-    beep(440)
-    frames, _frames = _frames, []
+    """Desliga a captura e devolve os frames por valor (evita a race do _frames
+    global). O _capture_lock faz o stop ESPERAR um begin em curso: ditado curto
+    pode soltar a tecla antes de o dispositivo ter aberto."""
+    global _frames, _capturing, _warm_until
+    with _capture_lock:
+        was = _capturing
+        _capturing = False
+        frames, _frames = _frames, []
+        _warm_until = time.time() + MIC_WARM_S
+        if was:
+            unmute_system()   # pareado com o mute_system, sob o mesmo lock
+            beep(440)
     return frames
 
 
@@ -1033,58 +1285,115 @@ def slot_handsfree_toggle():
         _handsfree_start()
 
 
+def _start_audio(mode):
+    """Abre o microfone FORA da thread da UI e liga a captura. Se falhar, desfaz
+    o estado logico e manda esconder a pill pelo sinal (hide so na thread da UI)."""
+    global _recording, _rec_mode
+    if _begin_capture():
+        log("Gravando..." if mode == "hold" else "Gravando (maos-livres)...")
+        return
+    with _state_lock:
+        # so desfaz se o estado ainda e o DESTE start: enquanto o dispositivo
+        # abria, o ditado pode ter terminado (o stop ja escondeu a pill) ou um
+        # novo pode ter comecado — nos dois casos nao ha nada a desfazer aqui.
+        if not (_recording and _rec_mode == mode):
+            return
+        _recording = False
+        _rec_mode = None
+    bridge.abort.emit(mode)
+
+
+def _stop_and_transcribe(mode="hold", target_hwnd=None):
+    """Fecha a captura (esperando um begin em curso) e transcreve. Fora da UI."""
+    worker(_end_capture(), mode=mode, target_hwnd=target_hwnd)
+
+
+def slot_abort(mode):
+    """Captura falhou: esconde a pill do modo que tentou gravar."""
+    if mode == "handsfree":
+        hf_window.hide_it()
+    else:
+        overlay.hide_it()
+
+
+def slot_normalizing(mode):
+    """Pill entra na fase 2. Roda na thread da UI (o worker so emite o sinal —
+    pintar fora da thread do Qt foi a causa do travamento de 03/08)."""
+    if mode == "handsfree":
+        hf_window.show_norm()
+    else:
+        overlay.show_norm()
+
+
 def _handsfree_start():
-    global _rec_mode, _hf_target_hwnd
+    global _recording, _rec_mode, _hf_target_hwnd
+    with _state_lock:
+        if _recording:
+            return
+        _recording = True
+        _rec_mode = "handsfree"
     _hf_target_hwnd = _get_foreground()   # captura o alvo ANTES de abrir a pill
     hf_window.show_recording()            # visual instantaneo (pill nao rouba foco)
-    if _begin_capture():
-        _rec_mode = "handsfree"
-        log("Gravando (maos-livres)...")
-    else:
-        hf_window.hide_it()
+    threading.Thread(target=_start_audio, args=("handsfree",), daemon=True).start()
 
 
 def _handsfree_stop():
-    global _rec_mode
-    frames = _end_capture()
-    _rec_mode = None
+    global _recording, _rec_mode
+    with _state_lock:
+        if not _recording or _rec_mode != "handsfree":
+            return
+        _recording = False
+        _rec_mode = None
     hf_window.show_busy()
     threading.Thread(
-        target=worker, args=(frames,),
+        target=_stop_and_transcribe,
         kwargs=dict(mode="handsfree", target_hwnd=_hf_target_hwnd), daemon=True,
     ).start()
 
 
 def slot_handsfree_cancel():
     """ESC durante a gravacao maos-livres: descarta (nao transcreve/cola/salva)."""
-    global _rec_mode
-    if _recording and _rec_mode == "handsfree":
-        _end_capture()   # fecha stream/desmuta; frames sao descartados
+    global _recording, _rec_mode
+    with _state_lock:
+        if not _recording or _rec_mode != "handsfree":
+            return
+        _recording = False
         _rec_mode = None
-        hf_window.hide_it()
-        log("Maos-livres cancelado (ESC).")
+    hf_window.hide_it()
+    # desmuta/limpa fora da UI: o _end_capture pode esperar um begin em curso
+    threading.Thread(target=_end_capture, daemon=True).start()
+    log("Maos-livres cancelado (ESC).")
 
 
 def slot_start():
-    global _rec_mode
-    overlay.show_recording()   # visual instantaneo, antes de abrir o audio (que pode demorar a frio)
+    """Thread da UI: SO pinta. Abrir o microfone vai pra uma thread porque a
+    frio ja segurou a UI por ate 5s — e com a UI presa cada auto-repeat da tecla
+    virava um start novo na fila, cujo 'else: hide_it()' escondia a pill da
+    gravacao em curso (86 ditados com visible=False no log). Ver a investigacao
+    de 2026-08-03."""
+    global _recording, _rec_mode
+    with _state_lock:
+        if _recording:
+            return
+        _recording = True
+        _rec_mode = "hold"
+    overlay.show_recording()
     if _t_press:
         log(f"[t] tecla->overlay {(time.perf_counter() - _t_press) * 1000:.0f}ms")
-    if _begin_capture():
-        _rec_mode = "hold"
-        log("Gravando...")
-    else:
-        overlay.hide_it()
+    threading.Thread(target=_start_audio, args=("hold",), daemon=True).start()
 
 
 def slot_stop():
-    global _rec_mode
-    frames = _end_capture()
-    _rec_mode = None
+    global _recording, _rec_mode
+    with _state_lock:
+        if not _recording or _rec_mode != "hold":
+            return
+        _recording = False
+        _rec_mode = None
     overlay.show_busy()
     # frames entregues por valor pra evitar a race do _frames global (uma nova
     # gravacao zerava o audio da anterior — ver _end_capture).
-    threading.Thread(target=worker, args=(frames,), daemon=True).start()
+    threading.Thread(target=_stop_and_transcribe, daemon=True).start()
 
 
 def _norm_for_echo(s):
@@ -1209,6 +1518,13 @@ def worker(frames, mode="hold", target_hwnd=None):
             beep(220, 280)
             return
 
+        # passe de formatacao. No-op quando desligado na tela Formatacao ou
+        # quando o ditado e curto demais pra compensar a espera; e fail-open,
+        # entao qualquer erro aqui devolve o texto que ja estava pronto.
+        if vai_normalizar(duration):
+            bridge.normalizing.emit(mode)   # pill: "✓ transcrito · organizando…"
+        text = normalizar_texto(text, duration)
+
         if read_setting("popup_enabled", True):
             # popup e o feedback de sucesso: pill some em silencio (-1.0)
             bridge.popup.emit(text, elapsed)
@@ -1260,6 +1576,8 @@ def recover_pending():
             sf.write(bio, data, sr, format="wav")
             text, err = transcribe_bytes(bio)
             if text and not err:
+                # mesmo passe do ditado normal (a duracao sai do proprio wav)
+                text = normalizar_texto(text, len(data) / float(sr))
                 now = datetime.datetime.now()
                 save_history(text, now)
                 log(f"recuperado [{name}] -> {text}")
@@ -1305,13 +1623,19 @@ def _handsfree_held():
 
 
 def on_press(key):
-    global _t_press, _handsfree_combo_active
+    global _t_press, _handsfree_combo_active, _hold_combo_active
     _pressed.add(key)
 
-    # hold-to-talk (level-triggered): grava enquanto segura a HOTKEY
-    if not _recording and _combo_held():
-        _t_press = time.perf_counter()
-        bridge.start.emit()
+    # hold-to-talk (edge-triggered NA THREAD DO HOOK): a trava fecha aqui, na
+    # hora. Antes o guard era so o _recording, que so vira True quando a thread
+    # da UI processa o sinal — com a UI ocupada abrindo o microfone, cada
+    # auto-repeat do Windows enfileirava um start (23 numa rajada em 2026-08-02
+    # 16:32, com 17s de atraso e a pill sumindo).
+    if _combo_held():
+        if not _hold_combo_active:
+            _hold_combo_active = True
+            _t_press = time.perf_counter()
+            bridge.start.emit()
 
     # maos-livres (edge-triggered): um toque no chord alterna start/stop.
     # Trava anti-repeat: o auto-repeat da tecla nao dispara de novo ate soltar.
@@ -1327,11 +1651,13 @@ def on_press(key):
 
 
 def on_release(key):
-    global _handsfree_combo_active
+    global _handsfree_combo_active, _hold_combo_active
     _pressed.discard(key)
 
-    # hold-to-talk para so quando quem grava e o hold (nao o maos-livres)
-    if _recording and _rec_mode == "hold" and not _combo_held():
+    # espelha a trava do on_press: quem emitiu o start emite o stop. O slot_stop
+    # ignora se quem grava nao e o hold (ou se a captura nem chegou a comecar).
+    if _hold_combo_active and not _combo_held():
+        _hold_combo_active = False
         bridge.stop.emit()
 
     # rearma o maos-livres quando o chord e solto
@@ -1380,6 +1706,8 @@ def main():
     bridge.handsfree_cancel.connect(slot_handsfree_cancel)
     bridge.handsfree_done.connect(hf_window.show_done)
     bridge.popup.connect(popup.show_text)
+    bridge.abort.connect(slot_abort)
+    bridge.normalizing.connect(slot_normalizing)
 
     # icone na bandeja (cara de programa instalado + botao Sair)
     tray = QSystemTrayIcon(QIcon(ICON_PATH), app)
@@ -1394,11 +1722,11 @@ def main():
     tray.setContextMenu(menu)
     tray.show()
 
-    # pre-aquece o audio (PortAudio) pro 1o acionamento ser instantaneo
-    try:
-        sd.query_devices()   # inicializa o PortAudio (parte fria) sem ocupar o microfone
-    except Exception as e:
-        log(f"warmup audio: {e}")
+    # pre-aquece o audio numa thread: abre o dispositivo de verdade (query_devices
+    # so inicializava o PortAudio, e o custo caro estava em abrir o stream — ate
+    # 5s logo apos o boot). Fica quente por MIC_WARM_S e depois o keeper fecha.
+    threading.Thread(target=_ensure_stream, daemon=True).start()
+    threading.Thread(target=_stream_keeper, daemon=True).start()
 
     # pre-aquece a API (1a chamada fria levava 6-16s vs 1-3s quente) e mantem
     # quente com ping periodico que reusa a conexao do pool
