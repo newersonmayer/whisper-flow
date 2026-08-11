@@ -7,8 +7,11 @@ C, ex: o antigo caminho COM do mute) que o try/except do Python nao captura, e o
 na pratica (ja deixou a ferramenta horas fora do ar). Aqui o relancamento e
 garantido: roda o dictate.py, espera ele morrer, e sobe de novo.
 
-A Tarefa Agendada "Ditador de Voz" deve apontar pra ESTE arquivo, nao pro
-dictate.py. Roda com pythonw (sem console).
+Windows: a Tarefa Agendada "Ditador de Voz" aponta pra ESTE arquivo, nao pro
+dictate.py, e roda com pythonw (sem console).
+macOS: o LaunchAgent com KeepAlive ja religa o processo, mas este supervisor
+continua no caminho — ele cobre o crash NATIVO em que o processo nao morre de
+verdade (fica zumbi), que o launchd nao enxerga.
 """
 import os
 import sys
@@ -18,7 +21,10 @@ import subprocess
 import datetime
 
 BASE = os.path.dirname(os.path.abspath(__file__))
-PYW = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
+sys.path.insert(0, BASE)
+import plataforma
+
+PYW = plataforma.python_do_venv()
 SCRIPT = os.path.join(BASE, "dictate.py")
 LOG = os.path.join(BASE, "supervisor.log")
 
@@ -46,10 +52,10 @@ def main():
         return
 
     if not os.path.exists(PYW):
-        log(f"pythonw do venv nao encontrado em {PYW}. Abortando.")
+        log(f"interpretador do venv nao encontrado em {PYW}. Abortando.")
         return
 
-    log("supervisor iniciado.")
+    log(f"supervisor iniciado ({plataforma.nome_do_sistema()}).")
     fails = 0
     while True:
         t0 = time.time()
