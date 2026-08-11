@@ -170,6 +170,15 @@ CORRECOES_PATH = os.path.join(BASE, "correcoes.txt")
 CORRECOES_EXAMPLE = os.path.join(BASE, "correcoes.example.txt")
 SETTINGS_PATH = os.path.join(BASE, "settings.json")          # preferencias da aba Ajustes
 ICON_PATH = os.path.join(BASE, "assets", "mic.ico")
+# Passe de normalizacao (ver normalizar_texto): tira vicio de fala, pontua e
+# quebra em paragrafos, conforme o preferencias.txt. Roda DEPOIS do
+# corrigir_termos, e so quando o usuario liga na aba Ajustes.
+PREFS_PATH = os.path.join(BASE, "preferencias.txt")            # editavel pela UI
+PREFS_EXAMPLE = os.path.join(BASE, "preferencias.example.txt")
+NORMALIZE_MODEL = os.getenv("NORMALIZE_MODEL", "gpt-5.6-luna")
+# Teto de espera do passe. Estourou, cola o texto de hoje: o passe e um bonus,
+# nunca pode custar um ditado (ver o fail-open no normalizar_texto).
+NORMALIZE_TIMEOUT_S = float(os.getenv("NORMALIZE_TIMEOUT", "20"))
 # Ping periodico + keep-alive de 120s no pool: com ping a cada 90s a MESMA
 # conexao TLS e reusada em toda transcricao (o default do httpx expira o
 # keep-alive em 5s, entao o ping antigo de 4min nao reusava nada — cada ditado
@@ -406,6 +415,119 @@ def corrigir_termos(texto):
     return texto
 
 
+def read_prefs():
+    """Preferencias de formatacao (o que o usuario quer que o passe faca).
+    Lidas a cada ditado — salvou na UI, ja vale na proxima, sem reiniciar.
+    Sem preferencias.txt, cai no .example versionado."""
+    for path in (PREFS_PATH, PREFS_EXAMPLE):
+        try:
+            with open(path, encoding="utf-8") as f:
+                txt = f.read().strip()
+            if txt:
+                return txt[:4000]
+        except OSError:
+            continue
+    return ""
+
+
+# ⚠️ A regra "na duvida NAO troque" nao e enfeite: sem ela, medido em
+# 10/08/2026 com 4 rodadas por variante, o modelo trocou um apelido que nao
+# conhecia ("Gudoce") por um termo do glossario ("Claude Code") em ate 3 de 4
+# rodadas — ou seja, INVENTOU uma correcao e mudou o sentido da fala. Com a
+# regra, 4/4 preservaram a palavra original. Se for mexer neste prompt,
+# re-rode o teste antes: uma rodada so nao pega alucinacao intermitente.
+_NORM_SYS = """Você limpa transcrições de ditado de voz em português do Brasil.
+Devolva SOMENTE o texto tratado — sem preâmbulo, sem comentário, sem markdown,
+sem responder ao conteúdo. Você NÃO é um assistente: você é um filtro de texto.
+
+REGRAS
+1. GLOSSÁRIO — corrija para estas grafias exatas quando o texto trouxer algo
+   foneticamente parecido:
+{vocab}
+
+⚠️ REGRA 1-B (a mais importante): na dúvida, NÃO troque.
+   Só aplique o glossário quando a palavra do texto for claramente a MESMA
+   palavra escrita errado (ex: "cloud.md" -> "CLAUDE.md", "Isaac" -> "Isaque").
+   Se encontrar uma palavra que NÃO reconhece e que NÃO é obviamente um termo
+   do glossário grafado errado, MANTENHA-A EXATAMENTE COMO ESTÁ. Nunca
+   substitua uma palavra desconhecida por um termo do glossário "no chute" —
+   inventar uma correção é pior do que deixar a palavra original.
+
+2. NÃO resuma, NÃO encurte ideias, NÃO invente, NÃO responda. Preserve TODO o
+   conteúdo e o tom de quem fala.
+
+PREFERÊNCIAS DE QUEM DITOU (siga à risca)
+{prefs}"""
+
+
+def vai_normalizar(duracao):
+    """O passe vai rodar neste ditado? Existe separado do normalizar_texto
+    porque a PILL precisa saber ANTES: mostrar "organizando" num ditado que
+    nao sera organizado e mentir sobre o estado — o mesmo defeito da tela que
+    prometia vocabulario e nao entregava."""
+    if not read_setting("normalizar_enabled", False):
+        return False
+    try:
+        minimo = float(read_setting("normalizar_min_seg", 30))
+    except (TypeError, ValueError):
+        minimo = 30.0
+    if duracao < minimo:
+        return False
+    return bool(read_prefs())
+
+
+def normalizar_texto(texto, duracao):
+    """Passe de formatacao pos-transcricao: tira vicio de fala, pontua, quebra
+    em paragrafos — conforme o preferencias.txt. Devolve o texto tratado, ou o
+    ORIGINAL se qualquer coisa der errado.
+
+    FAIL-OPEN por decisao: este passe e um bonus sobre um texto que ja esta
+    pronto e correto. Erro de API, timeout, resposta vazia ou modelo sem acesso
+    NAO podem custar o ditado — o precedente e o guard anti-eco de jul/2026,
+    que engoliu 12 ditados por poder devolver vazio.
+
+    So roda quando o usuario ligou na aba Ajustes E o audio passou do limiar:
+    ditado curto ("pode seguir") nao compensa a espera — medido em 10/08/2026,
+    58% dos ditados tem menos de 30s, mas os >=30s concentram 81% do audio
+    falado. O limiar pega quase todo o ganho pagando espera em menos da metade.
+    """
+    if not texto or not vai_normalizar(duracao):
+        return texto
+    prefs = read_prefs()
+    try:
+        t0 = time.perf_counter()
+        r = client.chat.completions.create(
+            model=NORMALIZE_MODEL,
+            messages=[
+                {"role": "system", "content": _NORM_SYS.format(
+                    vocab=read_vocab() or "(sem glossário)", prefs=prefs)},
+                {"role": "user", "content": texto},
+            ],
+            # 'low' porque o passe e reescrita, nao raciocinio: cortou 26% da
+            # latencia (7,2s -> 5,3s) sem perder qualidade, uma vez que a regra
+            # 1-B esta no prompt. 'minimal' nao e suportado por este modelo.
+            reasoning_effort="low",
+            timeout=NORMALIZE_TIMEOUT_S,
+        )
+        novo = (r.choices[0].message.content or "").strip()
+        ms = (time.perf_counter() - t0) * 1000
+        if not novo:
+            log("[norm] resposta vazia; mantendo o texto original")
+            return texto
+        # guarda contra o modelo resumir apesar da regra 2. Abaixo de 55% do
+        # tamanho nao e limpeza de vicio de fala, e perda de conteudo — medido:
+        # o passe saudavel devolve 87-96% do original.
+        if len(novo) < len(texto) * 0.55:
+            log(f"[norm] saida com {len(novo)}/{len(texto)} chars "
+                f"({len(novo)/len(texto):.0%}); parece resumo — descartando")
+            return texto
+        log(f"[t] normalizar {ms:.0f}ms | {len(texto)} -> {len(novo)} chars")
+        return novo
+    except Exception as e:
+        log(f"[norm] falhou ({str(e)[:90]}); mantendo o texto original")
+        return texto
+
+
 _warmup_busy = threading.Lock()
 
 
@@ -516,6 +638,7 @@ class Bridge(QObject):
     handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
     popup = pyqtSignal(str, float)    # (texto, segundos) -> ResultPopup (thread da UI)
     abort = pyqtSignal(str)   # modo cuja captura falhou -> esconde a pill NA thread da UI
+    normalizing = pyqtSignal(str)   # modo que entrou na fase 2 (pill "organizando")
 
 
 def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
@@ -539,12 +662,51 @@ def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
         p.drawArc(QRect(15, int(cy - 6), 12, 12), -ang * 16, 110 * 16)
         dots = "." * (int(time.time() * 2.5) % 4)
         p.setPen(QColor("#C9C9CE"))
-        # 8pt, nao 9pt: medido com QFontMetrics em 10/08/2026, "transcrevendo..."
-        # a 9pt ocupa 208px e este QRect tem 192px — o texto vinha sendo CORTADO
-        # em todo ditado. A 8pt sao 176px e sobra folga.
+        # 8pt, nao 9pt: medido em 10/08/2026, "transcrevendo..." a 9pt ocupa
+        # 208px e este QRect tem 192px — o texto vinha sendo CORTADO em todo
+        # ditado. A 8pt sao 176px e sobra folga.
         p.setFont(QFont("Segoe UI", 8))
         p.drawText(QRect(36, 0, w - 46, h), Qt.AlignVCenter | Qt.AlignLeft,
                    f"transcrevendo{dots}")
+        return
+    if mode == "norm":
+        # Fase 2 do passe de formatacao. A transcricao JA terminou — marcar
+        # como concluida (check, cinza, recuada) e o que faz os ~3-6s extras
+        # nao parecerem travamento: comunica que o essencial deu certo e falta
+        # so o polimento. E e literalmente verdade, porque o passe e fail-open.
+        #
+        # ⚠️ Layout definido por MEDICAO com QFontMetrics, nao por estimativa —
+        # a primeira versao desta pill usava a palavra "✓ transcrito" como
+        # TEXTO e estourava 134px: a 8pt ela sozinha ocupa 132px dos 217px
+        # uteis. O check DESENHADO custa 11px e diz a mesma coisa.
+        # Medido (217px uteis a partir de x=13):
+        #   check + arco + "organizando..." 8pt = 192px  <- esta versao
+        #   check + arco + "organizando..." 9pt = 220px  (estoura)
+        #   "✓ transcrito" 8pt + arco + texto   = 339px  (estoura feio)
+        x = 13
+        # check da fase concluida: cinza recuado, porque o trabalho essencial
+        # JA terminou — e o passe e fail-open, entao esse texto esta garantido
+        # mesmo se o que vem a seguir falhar.
+        pen = QPen(QColor("#6E6E76"), 1.8)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawLine(x, int(cy), x + 3, int(cy) + 4)
+        p.drawLine(x + 3, int(cy) + 4, x + 10, int(cy) - 4)
+        x += 20
+        # arco no LARANJA do acento (o busy e cinza): marca que agora e a etapa
+        # opcional, a que usa IA. Mesma cor do botao primario e do chip
+        # "garantia" — o acento significa consistentemente "a parte ativa".
+        ang = int((time.time() * 320) % 360)
+        pen = QPen(QColor("#F2A33C"), 2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        p.drawArc(QRect(x, int(cy - 5.5), 11, 11), -ang * 16, 110 * 16)
+        x += 18
+        dots = "." * (int(time.time() * 2.5) % 4)
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor("#C9C9CE"))
+        p.drawText(QRect(x, 0, max(10, w - x - 8), h),
+                   Qt.AlignVCenter | Qt.AlignLeft, f"organizando{dots}")
         return
     if mode in ("done", "fail"):
         ok = mode == "done"
@@ -652,6 +814,11 @@ class Overlay(QWidget):
         log(f"[diag] updates={self._n} maxlvl={self._max:.3f} "
             f"visible={self.isVisible()} geo={self.x()},{self.y()} {self.width()}x{self.height()}")
         self.mode = "busy"   # repaint continua rodando: anima o spinner
+        self.update()
+
+    def show_norm(self):
+        """Fase 2: transcricao pronta, passe de formatacao rodando."""
+        self.mode = "norm"
         self.update()
 
     def show_done(self, secs):
@@ -772,6 +939,10 @@ class HandsFreeWindow(QWidget):
     def show_busy(self):
         self.mode = "busy"
         self.btn.hide()   # transcrevendo: nao ha o que parar
+        self.update()
+
+    def show_norm(self):
+        self.mode = "norm"
         self.update()
 
     def show_done(self, secs):
@@ -1145,6 +1316,15 @@ def slot_abort(mode):
         overlay.hide_it()
 
 
+def slot_normalizing(mode):
+    """Pill entra na fase 2. Roda na thread da UI (o worker so emite o sinal —
+    pintar fora da thread do Qt foi a causa do travamento de 03/08)."""
+    if mode == "handsfree":
+        hf_window.show_norm()
+    else:
+        overlay.show_norm()
+
+
 def _handsfree_start():
     global _recording, _rec_mode, _hf_target_hwnd
     with _state_lock:
@@ -1338,6 +1518,13 @@ def worker(frames, mode="hold", target_hwnd=None):
             beep(220, 280)
             return
 
+        # passe de formatacao. No-op quando desligado na tela Formatacao ou
+        # quando o ditado e curto demais pra compensar a espera; e fail-open,
+        # entao qualquer erro aqui devolve o texto que ja estava pronto.
+        if vai_normalizar(duration):
+            bridge.normalizing.emit(mode)   # pill: "✓ transcrito · organizando…"
+        text = normalizar_texto(text, duration)
+
         if read_setting("popup_enabled", True):
             # popup e o feedback de sucesso: pill some em silencio (-1.0)
             bridge.popup.emit(text, elapsed)
@@ -1389,6 +1576,8 @@ def recover_pending():
             sf.write(bio, data, sr, format="wav")
             text, err = transcribe_bytes(bio)
             if text and not err:
+                # mesmo passe do ditado normal (a duracao sai do proprio wav)
+                text = normalizar_texto(text, len(data) / float(sr))
                 now = datetime.datetime.now()
                 save_history(text, now)
                 log(f"recuperado [{name}] -> {text}")
@@ -1518,6 +1707,7 @@ def main():
     bridge.handsfree_done.connect(hf_window.show_done)
     bridge.popup.connect(popup.show_text)
     bridge.abort.connect(slot_abort)
+    bridge.normalizing.connect(slot_normalizing)
 
     # icone na bandeja (cara de programa instalado + botao Sair)
     tray = QSystemTrayIcon(QIcon(ICON_PATH), app)
