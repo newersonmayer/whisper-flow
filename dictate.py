@@ -539,8 +539,11 @@ def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
         p.drawArc(QRect(15, int(cy - 6), 12, 12), -ang * 16, 110 * 16)
         dots = "." * (int(time.time() * 2.5) % 4)
         p.setPen(QColor("#C9C9CE"))
-        p.setFont(QFont("Segoe UI", 9))
-        p.drawText(QRect(36, 0, w - 48, h), Qt.AlignVCenter | Qt.AlignLeft,
+        # 8pt, nao 9pt: medido com QFontMetrics em 10/08/2026, "transcrevendo..."
+        # a 9pt ocupa 208px e este QRect tem 192px — o texto vinha sendo CORTADO
+        # em todo ditado. A 8pt sao 176px e sobra folga.
+        p.setFont(QFont("Segoe UI", 8))
+        p.drawText(QRect(36, 0, w - 46, h), Qt.AlignVCenter | Qt.AlignLeft,
                    f"transcrevendo{dots}")
         return
     if mode in ("done", "fail"):
