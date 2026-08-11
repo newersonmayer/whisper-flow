@@ -122,6 +122,37 @@ launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 launchctl kickstart -k "gui/$(id -u)/$LABEL" 2>/dev/null || true
 
+# ------------------------------------------- instrucao pro Claude Code ------
+# Mesmo papel do arquivo que o instalar.bat gera no Windows: da ao agente o
+# caminho REAL da instalacao (que so se sabe aqui) e o passo a passo de update.
+echo "==> gerando INSTRUCAO-CLAUDE-CODE.md"
+cat > "$BASE/INSTRUCAO-CLAUDE-CODE.md" <<INSTREOF
+## Ditador de voz (whisper) - auto-update
+
+Esta ferramenta esta instalada em: \`$BASE\`
+Sistema: **macOS**
+Repo: https://github.com/newersonmayer/whisper-flow (branch main, remote origin)
+
+Quando o usuario disser "atualize o whisper" / "atualiza o ditador de voz":
+1. Navegue ate \`$BASE\`.
+2. Rode \`git fetch\` e compare \`main\` com \`origin/main\`. Se ja estiver atualizado, avise e pare.
+3. Rode \`git pull\`.
+4. Se \`requirements.txt\` mudou no pull, rode \`$PY -m pip install -r requirements.txt\`.
+5. Reinicie pra carregar o codigo novo:
+   \`launchctl kickstart -k "gui/\$(id -u)/$LABEL"\`
+6. Confirme a linha "whisper-voice pronto (macOS)" no fim de \`dictate.log\`.
+
+Nunca edite, imprima nem versione o \`.env\` (contem a chave da API).
+Nunca sobrescreva: \`.env\`, \`vocabulario.txt\`, \`correcoes.txt\`,
+\`preferencias.txt\`, \`settings.json\`, \`transcricoes/\` — sao do usuario.
+
+Se a hotkey parar de funcionar, cheque NESTA ordem:
+1. \`grep -c HOTKEY .env\` — a linha some com facilidade ao editar o arquivo;
+2. permissao de Acessibilidade (Ajustes do Sistema > Privacidade e Seguranca):
+   sem ela o programa sobe normal e nunca recebe tecla, sem erro no log;
+3. \`launchctl print "gui/\$(id -u)/$LABEL" | head -20\` pra ver se esta rodando.
+INSTREOF
+
 echo
 echo "==================================================================="
 echo " Instalado. FALTA UM PASSO MANUAL — sem ele a tecla nao funciona:"
