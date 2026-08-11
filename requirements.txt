@@ -5,7 +5,10 @@ pyperclip==1.11.0
 python-dotenv==1.2.2
 pynput==1.8.2
 openai==2.38.0
-comtypes==1.4.16
-pycaw==20251023
+# Mute da saida de audio no Windows (Core Audio via COM). No macOS o setmute.py
+# usa osascript, que ja vem no sistema — instalar pycaw la falha, por isso o
+# marcador de ambiente (PEP 508).
+comtypes==1.4.16; sys_platform == "win32"
+pycaw==20251023; sys_platform == "win32"
 PyQt5==5.15.11
 PyQt-Fluent-Widgets==1.11.2

@@ -20,7 +20,6 @@ import shutil
 import socket
 import subprocess
 import threading
-import ctypes
 import datetime
 import traceback
 from collections import deque
@@ -30,7 +29,6 @@ import numpy as np
 import sounddevice as sd
 import soundfile as sf
 import pyperclip
-import winsound
 from dotenv import load_dotenv
 from pynput import keyboard
 from openai import OpenAI
@@ -41,6 +39,10 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QSystemTrayIcon, QMenu, QAction, QPushButton,
     QLabel, QVBoxLayout, QHBoxLayout,
 )
+
+# Tudo que difere entre Windows e macOS mora no plataforma.py. Este arquivo nao
+# toca API de sistema operacional direto — ver o cabecalho de la.
+import plataforma
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 load_dotenv(os.path.join(BASE, ".env"))
@@ -227,25 +229,18 @@ def log(msg):
 
 
 def beep(freq, ms=110):
-    threading.Thread(target=lambda: _beep(freq, ms), daemon=True).start()
-
-
-def _beep(freq, ms):
-    try:
-        winsound.Beep(freq, ms)
-    except Exception:
-        pass
+    # freq/ms valem no Windows; no macOS a freq escolhe qual som nativo tocar
+    threading.Thread(target=lambda: plataforma.beep(freq, ms), daemon=True).start()
 
 
 _muted_by_us = False
 _prev_mute = "0"           # estado do mute ANTES de mutarmos (preserva mute manual)
 _audio_lock = threading.Lock()
 SETMUTE = os.path.join(BASE, "setmute.py")
-# Interpretador do subprocesso de mute: o pythonw do venv (que tem pycaw),
+# Interpretador do subprocesso de mute: o do venv (que tem pycaw no Windows),
 # nao sys.executable — o dictate.py as vezes roda pelo Python global, que pode
 # nao ter pycaw instalado. Fallback pro interpretador atual se o venv sumir.
-_VENV_PY = os.path.join(BASE, "venv", "Scripts", "pythonw.exe")
-MUTE_PY = _VENV_PY if os.path.exists(_VENV_PY) else sys.executable
+MUTE_PY = plataforma.python_do_venv()
 
 
 def _setmute(action):
@@ -258,7 +253,7 @@ def _setmute(action):
         r = subprocess.run(
             [MUTE_PY, SETMUTE, action],
             capture_output=True, text=True, timeout=5,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            creationflags=plataforma.NO_WINDOW,
         )
         if r.returncode != 0:
             log(f"setmute {action} returncode={r.returncode}: {r.stderr.strip()}")
@@ -1143,23 +1138,19 @@ class ResultPopup(QWidget):
 
 
 def _get_foreground():
-    """HWND da janela em foco agora (o alvo do auto-paste no modo maos-livres)."""
-    try:
-        return ctypes.windll.user32.GetForegroundWindow()
-    except Exception:
-        return None
+    """Janela em foco agora (o alvo do auto-paste no modo maos-livres).
+    No macOS devolve None de proposito — ver plataforma.janela_em_foco()."""
+    return plataforma.janela_em_foco()
 
 
 def _focus_and_paste(text, hwnd):
     """Reforca o foco na janela-alvo e cola. Como a pill e NOACTIVATE, o alvo
     normalmente JA e o foreground — o SetForegroundWindow e rede de seguranca
-    (ex: se eu troquei de janela no meio, cola na que estava no inicio)."""
-    try:
-        if hwnd:
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-            time.sleep(0.05)
-    except Exception as e:
-        log(f"set foreground falhou: {e}")
+    (ex: se eu troquei de janela no meio, cola na que estava no inicio).
+    No macOS o reforco e no-op e so o paste acontece."""
+    if hwnd:
+        plataforma.focar_janela(hwnd)
+        time.sleep(0.05)
     paste(text)
 
 
@@ -1601,7 +1592,8 @@ def paste(text):
             previous = ""
     pyperclip.copy(text)
     time.sleep(0.08)
-    with kb.pressed(keyboard.Key.ctrl):
+    # Ctrl+V no Windows, Cmd+V no macOS
+    with kb.pressed(plataforma.modificador_de_colar(keyboard)):
         kb.press("v")
         kb.release("v")
     if not keep:
@@ -1744,7 +1736,15 @@ def main():
     # apaga audios alem da janela de retencao (texto fica; so o wav e rolling)
     threading.Thread(target=prune_old_audios, daemon=True).start()
 
-    log(f"whisper-voice pronto. Segura {HOTKEY_LABEL}, fala, solta. "
+    # No macOS, sem permissao de Acessibilidade o listener sobe LIMPO e nunca
+    # dispara — o sintoma e "aperto a tecla e nao acontece nada", identico a um
+    # bug de codigo. Uma linha no log economiza a investigacao inteira.
+    ok_acess, aviso = plataforma.acessibilidade_ok()
+    if aviso:
+        log(("[!] " if not ok_acess else "") + aviso)
+
+    log(f"whisper-voice pronto ({plataforma.nome_do_sistema()}). "
+        f"Segura {HOTKEY_LABEL}, fala, solta. "
         f"Maos-livres: {HANDSFREE_LABEL} (toggle).")
     sys.exit(app.exec_())
 

@@ -1,0 +1,18 @@
+# Shell script PRECISA de fim de linha LF. Com CRLF o macOS/Linux falha logo no
+# shebang: "bad interpreter: /bin/bash^M" — e a mensagem nao diz que o problema
+# e o fim de linha, entao custa caro descobrir.
+# Este repo e escrito no Windows, onde o autocrlf converte tudo pra CRLF; sem
+# esta regra o instalar-macos.sh chegaria quebrado no Mac.
+*.sh    text eol=lf
+
+# .bat e o oposto: precisa de CRLF pro cmd.exe do Windows.
+*.bat   text eol=crlf
+*.ps1   text eol=crlf
+
+# plist e XML lido pelo launchd (macOS)
+*.plist text eol=lf
+
+# Python funciona com os dois, mas manter LF evita diff sujo entre as maquinas
+*.py    text eol=lf
+*.md    text
+*.txt   text
