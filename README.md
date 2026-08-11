@@ -1,18 +1,47 @@
-# Ditador de Voz (F9)
+# Ditador de Voz
 
-Segure **F9**, fale, solte — o que você falou vira texto e é colado sozinho onde o
-cursor estiver (WhatsApp, e-mail, navegador, qualquer campo). Uma ondinha discreta
-aparece embaixo no centro da tela enquanto grava — e confirma com um **"✓ colado"**
-quando termina. O programa fica na bandeja do Windows (ícone de microfone) e sobe
-sozinho toda vez que o PC liga.
+Segure uma tecla, fale, solte — o que você falou vira texto e é colado sozinho
+onde o cursor estiver (WhatsApp, e-mail, navegador, qualquer campo). Uma ondinha
+discreta aparece embaixo no centro da tela enquanto grava — e confirma com um
+**"✓ colado"** quando termina. O programa fica na bandeja e sobe sozinho toda vez
+que o computador liga.
 
-Acompanha o app **Transcrições** (atalho no Menu Iniciar e no Desktop), com três abas:
+Roda em **Windows** e **macOS**.
+
+Acompanha o app **Transcrições**, com cinco abas:
 - **Gravar** — gravação livre por clique (pra ditar enquanto mexe na tela);
 - **Histórico** — tudo que foi transcrito, por dia, com busca e **Copiar**;
-- **Vocabulário** — termos que a transcrição costuma errar (nomes, siglas, jargão).
-  Salvou, valeu na próxima gravação — sem reiniciar nada.
+- **Palavras** — correções de grafia e vocabulário (veja a diferença abaixo);
+- **Formatação** — limpa vícios de fala e organiza o texto (opcional, desligado por padrão);
+- **Ajustes** — clipboard e popup.
 
-A transcrição usa a API de áudio da OpenAI (`gpt-4o-mini-transcribe` por padrão).
+A transcrição usa a API de áudio da OpenAI (`gpt-transcribe` por padrão).
+
+---
+
+> ## 🤖 Se você é um agente (Claude Code) instalando isto pra alguém
+>
+> **Antes de qualquer coisa, descubra o sistema operacional.** Os dois caminhos
+> são diferentes e o errado falha de forma confusa:
+>
+> - **macOS** → seção [Instalar no macOS](#instalar-no-macos). Use
+>   `./instalar-macos.sh`. **Não** existe `instalar.bat` aqui.
+> - **Windows** → seção [Instalação (passo a passo)](#instalação-passo-a-passo).
+>   Use `instalar.bat`.
+>
+> **No macOS, dois passos são MANUAIS e você não consegue fazer por eles** —
+> exigem clique nos Ajustes do Sistema. Termine a instalação dizendo isso com
+> todas as letras:
+> 1. **Privacidade e Segurança → Acessibilidade** (senão a hotkey nunca dispara,
+>    e **não aparece erro nenhum** — o programa sobe normal e fica mudo);
+> 2. **Privacidade e Segurança → Microfone**.
+>
+> **Nunca** peça a chave da OpenAI no chat nem a escreva você mesmo: instrua a
+> pessoa a colar no `.env`, em **UTF-8 sem BOM** (o BOM corrompe a primeira
+> linha e o programa não sobe).
+>
+> Confirme o sucesso lendo o fim do `dictate.log` — tem que aparecer
+> `whisper-voice pronto (macOS)` ou `whisper-voice pronto (Windows)`.
 
 ---
 
@@ -211,21 +240,40 @@ Se você **baixou o ZIP**: baixe o ZIP novo, substitua os arquivos na pasta
 
 ## Para quem usa Claude Code (instalar e atualizar por chat)
 
-Instale via `git clone` (necessário pro auto-update). O `instalar.bat` gera o
-arquivo **`INSTRUCAO-CLAUDE-CODE.md`** com o caminho da instalação já preenchido
-e o passo a passo de atualização acima embutido.
+Instale via `git clone` (necessário pro auto-update). Depois é só dizer no chat:
 
-No Claude Code, diga **uma vez**:
+> "Instala essa ferramenta pra mim: https://github.com/newersonmayer/whisper-flow"
+
+O agente lê este README, **detecta o seu sistema** e segue o caminho certo — o
+bloco 🤖 no topo do arquivo existe pra isso. No fim, ele te diz quais permissões
+você precisa conceder na mão (no macOS são duas, e sem elas nada funciona).
+
+Os dois instaladores geram um **`INSTRUCAO-CLAUDE-CODE.md`** com o caminho da
+instalação já preenchido e o passo a passo de atualização embutido. Para ativar
+o auto-update, diga **uma vez**:
 
 > "Leia o arquivo `INSTRUCAO-CLAUDE-CODE.md` em `<pasta onde você clonou>` e
 > adicione essa instrução ao meu `CLAUDE.md`."
 
-O próprio Claude escreve a instrução no seu `CLAUDE.md` — você não edita nada na
-mão. A partir daí, basta dizer algo como **"atualiza a ferramenta whisper voice"**
-no chat que ele sozinho: confere se há novidade no repositório, roda o `git pull`,
-reinstala dependências se mudaram, recria atalhos se o instalador mudou, reinicia
-os dois programas e confirma no log — **preservando sua tecla de atalho, sua chave
-e seu vocabulário**.
+A partir daí, basta dizer **"atualiza a ferramenta whisper voice"** que ele
+sozinho: confere se há novidade no repositório, roda o `git pull`, reinstala
+dependências se mudaram, reinicia os dois programas e confirma no log —
+**preservando sua tecla de atalho, sua chave, seu vocabulário e suas correções**.
+
+### Reiniciar os programas (o agente precisa disso pra aplicar código novo)
+
+**Windows** — encerre os processos `pythonw.exe` cujo command line contenha
+`dictate.py` (o supervisor religa em ~2s) e `historico.py`, e relance o app com
+`venv\Scripts\pythonw.exe historico.py --hidden`. Cada programa aparece como
+**dois** processos (launcher do venv + Python real) — encerre todos que casarem.
+
+**macOS** — o LaunchAgent religa sozinho:
+
+```bash
+launchctl kickstart -k "gui/$(id -u)/com.newersonmayer.whispervoice"
+```
+
+Em ambos, confirme no fim do `dictate.log` a linha `whisper-voice pronto`.
 
 ---
 
@@ -262,14 +310,23 @@ e seu vocabulário**.
 | Arquivo | Função |
 |---|---|
 | `dictate.py` | O programa principal (hotkey, gravação, transcrição, colagem) |
-| `historico.py` | App Transcrições (gravação livre, histórico com áudio, vocabulário) |
-| `supervisor.py` | Relança o `dictate.py` se ele cair (a Tarefa Agendada roda ele) |
-| `instalar.bat` | Instala tudo e configura a inicialização |
-| `registrar-tarefa.ps1` | Cria a Tarefa Agendada e os atalhos (chamado pelo instalador) |
-| `parar.bat` | Para o programa |
-| `desinstalar.bat` | Remove a inicialização automática |
+| `historico.py` | App Transcrições (gravar, histórico, palavras, formatação, ajustes) |
+| **`plataforma.py`** | **Tudo que difere entre Windows e macOS.** Nenhum outro arquivo toca API de sistema direto — se precisar de algo do SO, entra aqui |
+| `setmute.py` | Muta a saída de áudio durante a gravação (subprocesso isolado) |
+| `supervisor.py` | Relança o `dictate.py` se ele cair |
+| `instalar.bat` | **Windows** — instala tudo e configura a inicialização |
+| `registrar-tarefa.ps1` | **Windows** — cria a Tarefa Agendada e os atalhos |
+| `parar.bat` / `desinstalar.bat` | **Windows** — parar / remover a inicialização |
+| **`instalar-macos.sh`** | **macOS** — venv, dependências, `.env` e LaunchAgent. `--remover` desfaz |
+| `.gitattributes` | Fixa LF nos `.sh` — com CRLF o script não roda no Mac |
 | `.env.example` | Modelo do arquivo de configuração |
-| `vocabulario.example.txt` | Modelo do vocabulário (vira o seu `vocabulario.txt`) |
+| `vocabulario.example.txt` | Modelo do vocabulário — **substituído** pelo seu `vocabulario.txt` |
+| `correcoes.example.txt` | Correções compartilhadas — **somadas** ao seu `correcoes.txt` |
+| `preferencias.example.txt` | Modelo das preferências — **substituído** pelo seu `preferencias.txt` |
+
+⚠️ Repare na diferença: as **correções somam** (você recebe as do repo *e* mantém
+as suas), enquanto vocabulário e preferências **substituem** (o seu arquivo local
+ganha do `.example`).
 
 ## Solução de problemas
 
