@@ -1782,6 +1782,29 @@ def _thread_excepthook(args):
         traceback.format_exception(args.exc_type, args.exc_value, args.exc_traceback)))
 
 
+def _avisar_colisao_de_hotkey():
+    """As duas hotkeys podem casar na MESMA tecla sem ninguem perceber, porque
+    token generico expande: 'ctrl' vira {ctrl, ctrl_l, ctrl_r} e 'alt' vira
+    {alt, alt_l, alt_r, alt_gr}. Com HOTKEY='alt_gr/ctrl_r' e HANDSFREE
+    ='ctrl+alt+space', tanto o Ctrl direito quanto o AltGr acionavam os dois.
+
+    Quando isso acontece o HOLD dispara primeiro (on_press checa ele antes) e o
+    maos-livres nunca comeca: o slot_handsfree_toggle sai no
+    'if _recording and _rec_mode == "hold": return'. O sintoma enganoso e "o
+    toggle nao funciona com este teclado" — e nao ha nada no log dizendo porque.
+    Decisao: .specs/#03-colisoes-de-gravacao/overview.md"""
+    comuns = set()
+    for tok_hold in HOTKEY:
+        for tok_hf in HANDSFREE_HOTKEY:
+            comuns |= (tok_hold & tok_hf)
+    if not comuns:
+        return
+    nomes = ", ".join(sorted(getattr(k, "name", str(k)) for k in comuns))
+    log(f"[!] HOTKEY ({_HOTKEY_SPEC}) e HOTKEY_HANDSFREE ({_HANDSFREE_SPEC}) "
+        f"compartilham tecla: {nomes}. O hold dispara primeiro e engole o "
+        f"maos-livres. Use lados especificos (ctrl_l/ctrl_r, alt_l/alt_gr).")
+
+
 def main():
     # captura qualquer erro nao tratado num log com traceback (pythonw nao tem console)
     sys.excepthook = _log_uncaught
@@ -1857,6 +1880,8 @@ def main():
     ok_acess, aviso = plataforma.acessibilidade_ok()
     if aviso:
         log(("[!] " if not ok_acess else "") + aviso)
+
+    _avisar_colisao_de_hotkey()
 
     log(f"whisper-voice pronto ({plataforma.nome_do_sistema()}). "
         f"Segura {HOTKEY_LABEL}, fala, solta. "
