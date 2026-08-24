@@ -323,11 +323,17 @@ def load_vocab_editor():
 
 
 def transcribe(audio, sr=SR):
-    """audio: np.int16 mono. Retorna (texto, erro)."""
+    """audio: np.int16 mono. Retorna (texto, erro).
+
+    O teto por tentativa e o mesmo do dictate.py e existe pelo mesmo motivo: sem
+    ele vale o DEFAULT_TIMEOUT=600s da SDK, que ja segurou um ditado de 38,6s
+    por 608,7s. max_retries=0 porque o laco de retry e o de baixo."""
     import soundfile as sf
     bio = io.BytesIO()
     sf.write(bio, audio, sr, format="wav")
-    kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"), language=LANGUAGE)
+    tmo = max(25.0, 10.0 + (len(audio) / float(sr)) * 0.20)
+    kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"),
+                  language=LANGUAGE, timeout=tmo)
     vocab = read_vocab()
     if vocab:
         kwargs["prompt"] = vocab
@@ -335,7 +341,7 @@ def transcribe(audio, sr=SR):
     for attempt in range(API_RETRIES):
         try:
             bio.seek(0)
-            r = get_client().audio.transcriptions.create(**kwargs)
+            r = get_client().with_options(max_retries=0).audio.transcriptions.create(**kwargs)
             return (r.text or "").strip(), None
         except Exception as e:
             err = str(e)[:140]
