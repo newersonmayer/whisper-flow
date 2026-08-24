@@ -181,6 +181,21 @@ NORMALIZE_MODEL = os.getenv("NORMALIZE_MODEL", "gpt-5.6-luna")
 # Teto de espera do passe. Estourou, cola o texto de hoje: o passe e um bonus,
 # nunca pode custar um ditado (ver o fail-open no normalizar_texto).
 NORMALIZE_TIMEOUT_S = float(os.getenv("NORMALIZE_TIMEOUT", "20"))
+
+# Teto de UMA tentativa de transcricao, proporcional a duracao do audio.
+# ⚠️ Sem isto o teto e o da SDK: DEFAULT_TIMEOUT = 600s (openai/_constants.py),
+# e 600s e teto de mentira — o dictate.log tem um audio de 38,6s que ficou
+# 608,7s na API: dez minutos de pill travada por meio minuto de fala.
+# Pior, DEFAULT_MAX_RETRIES = 2 na SDK MULTIPLICA com o API_RETRIES=3 daqui
+# (ate 9 tentativas), por isso a chamada usa with_options(max_retries=0) e
+# deixa a repeticao so no laco daqui, que loga cada tentativa.
+# Calibragem medida nos 2.892 ditados com timing do historico: a API leva
+# p99 entre 6s e 20s conforme a faixa de duracao. O teto abaixo teria abortado
+# 3 ditados (0,10%) — e os 3 sao justamente os patologicos (608,7s, 209,4s e
+# 34,9s). Mexer aqui sem re-rodar essa conta e chutar.
+TRANSCRIBE_TIMEOUT_MIN = float(os.getenv("TRANSCRIBE_TIMEOUT_MIN", "25"))
+TRANSCRIBE_TIMEOUT_BASE = float(os.getenv("TRANSCRIBE_TIMEOUT_BASE", "10"))
+TRANSCRIBE_TIMEOUT_K = float(os.getenv("TRANSCRIBE_TIMEOUT_K", "0.20"))
 # Ping periodico + keep-alive de 120s no pool: com ping a cada 90s a MESMA
 # conexao TLS e reusada em toda transcricao (o default do httpx expira o
 # keep-alive em 5s, entao o ping antigo de 4min nao reusava nada — cada ditado
@@ -1502,10 +1517,23 @@ def _looks_like_vocab_echo(text, vocab):
     return i == len(t)
 
 
-def transcribe_bytes(bio):
+def transcribe_timeout(duracao):
+    """Teto de UMA tentativa. Cresce com o audio porque a latencia da API tambem
+    cresce (p50 medido: 1,5s ate 15s de fala; 9,4s acima de 4min)."""
+    return max(TRANSCRIBE_TIMEOUT_MIN,
+               TRANSCRIBE_TIMEOUT_BASE + duracao * TRANSCRIBE_TIMEOUT_K)
+
+
+def transcribe_bytes(bio, duracao=0.0):
     """Transcreve um buffer WAV (BytesIO). Retorna (texto, erro)."""
     err = None
-    base_kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"), language=LANGUAGE)
+    tmo = transcribe_timeout(duracao)
+    # max_retries=0 SO nesta chamada: o laco de retry e daqui (e loga cada
+    # tentativa). Sem isso a SDK retenta por dentro e o teto vira 3x o esperado.
+    # with_options nao cria conexao nova — reusa o mesmo httpx.Client.
+    api = client.with_options(max_retries=0)
+    base_kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"),
+                       language=LANGUAGE, timeout=tmo)
     kwargs = dict(base_kwargs)
     vocab = read_vocab()
     if vocab:
@@ -1516,7 +1544,7 @@ def transcribe_bytes(bio):
     for attempt in range(API_RETRIES):
         try:
             bio.seek(0)
-            r = client.audio.transcriptions.create(**kwargs)
+            r = api.audio.transcriptions.create(**kwargs)
             text = (r.text or "").strip()
             # guard anti-eco: se a saida for um trecho do vocabulario, o modelo
             # ecoou o prompt em vez de transcrever. Refaz sem prompt — a fala e
@@ -1526,7 +1554,7 @@ def transcribe_bytes(bio):
             if MODEL.startswith("whisper") and vocab and text and _looks_like_vocab_echo(text, vocab):
                 log("saida parece eco do vocabulario; refazendo sem prompt")
                 bio.seek(0)
-                r = client.audio.transcriptions.create(**base_kwargs)
+                r = api.audio.transcriptions.create(**base_kwargs)
                 # se o retry vier vazio, o ditado seria PERDIDO — melhor devolver
                 # a saida suspeita que engolir a fala (12 ocorrencias no log).
                 text = (r.text or "").strip() or text
@@ -1534,7 +1562,7 @@ def transcribe_bytes(bio):
             return corrigir_termos(text), None
         except Exception as e:
             err = str(e)[:90]
-            log(f"api tentativa {attempt + 1} falhou: {err}")
+            log(f"api tentativa {attempt + 1} falhou (teto {tmo:.0f}s): {err}")
             time.sleep(0.5)
     return "", err
 
@@ -1575,7 +1603,7 @@ def worker(frames, mode="hold", target_hwnd=None):
         bio = io.BytesIO()
         sf.write(bio, audio, SR, format="wav")
         t0 = time.time()
-        text, err = transcribe_bytes(bio)
+        text, err = transcribe_bytes(bio, duration)
         elapsed = time.time() - t0
         log(f"[t] encode {(t0 - t_enc) * 1000:.0f}ms | api {elapsed:.1f}s | audio {duration:.1f}s")
 
@@ -1647,7 +1675,7 @@ def recover_pending():
             data, sr = sf.read(fp, dtype="int16")
             bio = io.BytesIO()
             sf.write(bio, data, sr, format="wav")
-            text, err = transcribe_bytes(bio)
+            text, err = transcribe_bytes(bio, len(data) / float(sr))
             if text and not err:
                 # mesmo passe do ditado normal (a duracao sai do proprio wav)
                 text = normalizar_texto(text, len(data) / float(sr))
