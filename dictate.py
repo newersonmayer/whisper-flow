@@ -636,7 +636,7 @@ class Bridge(QObject):
     normalizing = pyqtSignal(str)   # modo que entrou na fase 2 (pill "organizando")
 
 
-def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
+def _draw_pill(p, w, h, mode, levels, rec_start, msg="", note=""):
     """FONTE UNICA da animacao da pill — o Overlay (hold-to-talk) e a
     HandsFreeWindow (maos-livres) desenham pela MESMA funcao, entao a animacao e
     identica e nao ha codigo duplicado. Pinta num retangulo w x h com origem em
@@ -717,19 +717,33 @@ def _draw_pill(p, w, h, mode, levels, rec_start, msg=""):
     p.setBrush(QColor(235, 70, 70, int(130 + 125 * pulse)))
     p.drawEllipse(13, int(cy - 3), 7, 7)
 
-    # onda espelhada em cinza
+    # onda espelhada em cinza — ou a nota efemera, quando houver uma.
     timer_w = 46
     x0 = 28
     area_w = w - x0 - timer_w - 10
-    spacing = area_w / (N_POINTS - 1)
-    amp = h * 0.32
-    pen = QPen(QColor("#9A9AA0"), 2.0)
-    pen.setCapStyle(Qt.RoundCap)
-    p.setPen(pen)
-    for i, lvl in enumerate(levels):
-        ext = max(1.0, lvl * amp)
-        x = x0 + i * spacing
-        p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
+    if note:
+        # Nota SOBRE o estado rec: o ponto REC e o timer continuam desenhados,
+        # so a onda cede o lugar. Trocar o self.mode esconderia os dois e a pill
+        # leria como "parou" no meio de uma gravacao viva — pior que o silencio
+        # que isso veio consertar.
+        # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (a).
+        #
+        # ⚠️ area_w e ~156px e a 8pt cada char custa ~10px: teto de ~15 chars.
+        # Medir com QFontMetrics antes de trocar o texto — esta pill ja cortou
+        # "transcrevendo..." e ja estourou com "✓ transcrito" (ver acima).
+        p.setFont(QFont("Segoe UI", 8))
+        p.setPen(QColor("#C9C9CE"))
+        p.drawText(QRect(x0, 0, area_w, h), Qt.AlignVCenter | Qt.AlignLeft, note)
+    else:
+        spacing = area_w / (N_POINTS - 1)
+        amp = h * 0.32
+        pen = QPen(QColor("#9A9AA0"), 2.0)
+        pen.setCapStyle(Qt.RoundCap)
+        p.setPen(pen)
+        for i, lvl in enumerate(levels):
+            ext = max(1.0, lvl * amp)
+            x = x0 + i * spacing
+            p.drawLine(int(x), int(cy - ext), int(x), int(cy + ext))
 
     # timer de gravacao (cinza quase branco)
     e = time.time() - rec_start
@@ -761,6 +775,8 @@ class Overlay(QWidget):
         self.setFixedSize(self.W, self.H)
         self.mode = "rec"
         self.msg = ""
+        self.note = ""          # nota efemera desenhada por cima do estado rec
+        self.note_until = 0.0   # expira sozinha no proximo repaint (30fps)
         self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
         self.rec_start = 0.0
         self._n = 0
@@ -793,8 +809,24 @@ class Overlay(QWidget):
         y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
         self.move(x, y)
 
+    def _active_note(self):
+        """A nota so vale ate note_until. Nao precisa de QTimer: o repaint de
+        30fps do estado rec ja chama paintEvent de novo e ela some sozinha."""
+        return self.note if time.time() < self.note_until else ""
+
+    def flash_note(self, text, ms=1200):
+        """Nota efemera SOBRE o estado atual — NAO troca self.mode, entao onda e
+        timer continuam na tela. Ver .specs/#03-colisoes-de-gravacao/_ux-veredito.md."""
+        if self.mode != "rec":
+            return
+        self.note = text
+        self.note_until = time.time() + ms / 1000.0
+        self.update()
+
     def show_recording(self):
         self.mode = "rec"
+        self.note = ""
+        self.note_until = 0.0
         self.rec_start = time.time()
         self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
         self._n = 0
@@ -808,11 +840,23 @@ class Overlay(QWidget):
     def show_busy(self):
         log(f"[diag] updates={self._n} maxlvl={self._max:.3f} "
             f"visible={self.isVisible()} geo={self.x()},{self.y()} {self.width()}x{self.height()}")
+        if _recording:
+            # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
+            # inteiro — transcreve, normaliza, salva no historico e cola; so perde
+            # a vez no visual. Mesmo guard que o show_done ja tinha.
+            # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (b).
+            return
         self.mode = "busy"   # repaint continua rodando: anima o spinner
         self.update()
 
     def show_norm(self):
         """Fase 2: transcricao pronta, passe de formatacao rodando."""
+        if _recording:
+            # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
+            # inteiro — transcreve, normaliza, salva no historico e cola; so perde
+            # a vez no visual. Mesmo guard que o show_done ja tinha.
+            # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (b).
+            return
         self.mode = "norm"
         self.update()
 
@@ -854,7 +898,7 @@ class Overlay(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         _draw_pill(p, self.width(), self.height(), self.mode,
-                   self.levels, self.rec_start, self.msg)
+                   self.levels, self.rec_start, self.msg, self._active_note())
 
 
 class HandsFreeWindow(QWidget):
@@ -885,6 +929,8 @@ class HandsFreeWindow(QWidget):
         self.setFixedSize(self.W, self.H)
         self.mode = "rec"
         self.msg = ""
+        self.note = ""
+        self.note_until = 0.0
         self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
         self.rec_start = 0.0
 
@@ -919,8 +965,24 @@ class HandsFreeWindow(QWidget):
         y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
         self.move(x, y)
 
+    def _active_note(self):
+        """A nota so vale ate note_until. Nao precisa de QTimer: o repaint de
+        30fps do estado rec ja chama paintEvent de novo e ela some sozinha."""
+        return self.note if time.time() < self.note_until else ""
+
+    def flash_note(self, text, ms=1200):
+        """Nota efemera SOBRE o estado atual — NAO troca self.mode, entao onda e
+        timer continuam na tela. Ver .specs/#03-colisoes-de-gravacao/_ux-veredito.md."""
+        if self.mode != "rec":
+            return
+        self.note = text
+        self.note_until = time.time() + ms / 1000.0
+        self.update()
+
     def show_recording(self):
         self.mode = "rec"
+        self.note = ""
+        self.note_until = 0.0
         self.rec_start = time.time()
         self.levels = deque([0.0] * N_POINTS, maxlen=N_POINTS)
         self.btn.setText("■  Parar")
@@ -932,11 +994,23 @@ class HandsFreeWindow(QWidget):
         self.update()
 
     def show_busy(self):
+        if _recording:
+            # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
+            # inteiro — transcreve, normaliza, salva no historico e cola; so perde
+            # a vez no visual. Mesmo guard que o show_done ja tinha.
+            # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (b).
+            return
         self.mode = "busy"
         self.btn.hide()   # transcrevendo: nao ha o que parar
         self.update()
 
     def show_norm(self):
+        if _recording:
+            # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
+            # inteiro — transcreve, normaliza, salva no historico e cola; so perde
+            # a vez no visual. Mesmo guard que o show_done ja tinha.
+            # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (b).
+            return
         self.mode = "norm"
         self.update()
 
@@ -979,7 +1053,7 @@ class HandsFreeWindow(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         _draw_pill(p, self.PILL_W, self.PILL_H, self.mode,
-                   self.levels, self.rec_start, self.msg)
+                   self.levels, self.rec_start, self.msg, self._active_note())
 
 
 class ResultPopup(QWidget):
@@ -1364,10 +1438,18 @@ def slot_start():
     de 2026-08-03."""
     global _recording, _rec_mode
     with _state_lock:
-        if _recording:
-            return
-        _recording = True
-        _rec_mode = "hold"
+        ja = _rec_mode if _recording else None
+        if not ja:
+            _recording = True
+            _rec_mode = "hold"
+    if ja:
+        # Hotkey redundante — tipicamente apertar o Ctrl do hold no meio de um
+        # ditado maos-livres. Isso JA era um no-op seguro; o que faltava era
+        # dizer isso, porque no-op silencioso le como "quebrei a gravacao" e o
+        # Newerson parava de falar achando que tinha perdido o ditado.
+        # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md caso (a).
+        (hf_window if ja == "handsfree" else overlay).flash_note("já gravando")
+        return
     overlay.show_recording()
     if _t_press:
         log(f"[t] tecla->overlay {(time.perf_counter() - _t_press) * 1000:.0f}ms")
@@ -1636,10 +1718,15 @@ def on_press(key):
             _handsfree_combo_active = True
             bridge.handsfree_toggle.emit()
 
-    # ESC cancela — so quando o maos-livres esta gravando (a pill nao tem foco de
-    # teclado por ser NOACTIVATE, entao o ESC vem do listener global, nao dela)
-    if key == keyboard.Key.esc and _recording and _rec_mode == "handsfree":
-        bridge.handsfree_cancel.emit()
+    # ⚠️ ESC NAO cancela mais — removido a pedido do Newerson em 24/08/2026.
+    # A spec #01 previa ESC descartando o maos-livres (item 7 e criterio de
+    # aceite). Na pratica ele acertava a tecla sem querer no meio da fala e
+    # perdia o ditado inteiro, varias vezes. Nao existe mais atalho de descarte:
+    # pra descartar, deixe transcrever e ignore o texto.
+    # O slot_handsfree_cancel e o sinal handsfree_cancel continuam existindo, de
+    # proposito e sem ninguem emitindo — sao o caminho pronto caso ele queira o
+    # cancelamento de volta atras de uma tecla menos perigosa. Nao apague.
+    # Decisao: .specs/#03-colisoes-de-gravacao/_ux-veredito.md
 
 
 def on_release(key):
