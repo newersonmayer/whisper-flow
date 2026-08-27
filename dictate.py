@@ -146,6 +146,22 @@ LANGUAGE = "pt"
 # vocabulario sao o MESMO mecanismo; nao da pra ter um sem o outro. Por isso a
 # grafia dos termos nao depende mais do modelo: ver corrigir_termos() abaixo.
 MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
+# Formato em que o audio SOBE pra API. O WAV cru (PCM 16 bits, 16 kHz, mono)
+# custa 32 KB por segundo de fala, e era o gargalo REAL da transcricao — nao o
+# modelo. Medido em 27/08/2026 nos 2.993 ditados com timing do dictate.log e
+# num A/B ao vivo: um ditado de 57s sobe 1,83 MB em WAV e a API levou de 4,3s a
+# 41,3s conforme a banda do momento, enquanto a inferencia nunca passou de
+# ~1,6s. O mesmo audio em OGG/Opus da 199 KB (9,0x menor) e o texto sai
+# IDENTICO (692 vs 694 chars, mesmo modelo, minutos de diferenca).
+# Replay dos 2.993 ditados com o tamanho novo: p50 2,2s -> 1,3s,
+# p99 11,6s -> 7,3s, e os 11 ditados que passaram de 20s viram 2.
+# ⚠️ O que fica em DISCO (pendentes/ e audios/) continua WAV de proposito: um e
+# a copia de seguranca de uma queda, o outro e o acervo que o app casa com o
+# historico por timestamp (glob "*.wav" em recuperar_pendentes e archive_audio).
+UPLOAD_FORMAT = "OGG"
+UPLOAD_SUBTYPE = "OPUS"
+UPLOAD_NAME = "audio.ogg"
+UPLOAD_MIME = "audio/ogg"
 API_RETRIES = 3
 BLOCK = 320           # 20ms por bloco -> ~50 updates/s (onda fluida)
 N_POINTS = 56
@@ -1517,6 +1533,19 @@ def _looks_like_vocab_echo(text, vocab):
     return i == len(t)
 
 
+def encode_upload(audio, sr=SR):
+    """Compacta o audio no formato que sobe pra API (ver UPLOAD_FORMAT).
+
+    Custa ~8,8ms por segundo de fala (medido: 501ms num ditado de 57s, linear e
+    sem custo de primeira chamada). Quem grava pela hotkey nao paga isso: o
+    _StreamEncoder ja encodou durante a fala e esta funcao so entra como
+    fallback. Quem paga e a recuperacao de pendentes/, que roda no boot."""
+    bio = io.BytesIO()
+    sf.write(bio, audio, sr, format=UPLOAD_FORMAT, subtype=UPLOAD_SUBTYPE)
+    bio.seek(0)
+    return bio
+
+
 def transcribe_timeout(duracao):
     """Teto de UMA tentativa. Cresce com o audio porque a latencia da API tambem
     cresce (p50 medido: 1,5s ate 15s de fala; 9,4s acima de 4min)."""
@@ -1532,7 +1561,7 @@ def transcribe_bytes(bio, duracao=0.0):
     # tentativa). Sem isso a SDK retenta por dentro e o teto vira 3x o esperado.
     # with_options nao cria conexao nova — reusa o mesmo httpx.Client.
     api = client.with_options(max_retries=0)
-    base_kwargs = dict(model=MODEL, file=("audio.wav", bio, "audio/wav"),
+    base_kwargs = dict(model=MODEL, file=(UPLOAD_NAME, bio, UPLOAD_MIME),
                        language=LANGUAGE, timeout=tmo)
     kwargs = dict(base_kwargs)
     vocab = read_vocab()
@@ -1600,8 +1629,7 @@ def worker(frames, mode="hold", target_hwnd=None):
 
         log(f"Transcrevendo {duration:.1f}s...")
         t_enc = time.time()
-        bio = io.BytesIO()
-        sf.write(bio, audio, SR, format="wav")
+        bio = encode_upload(audio)
         t0 = time.time()
         text, err = transcribe_bytes(bio, duration)
         elapsed = time.time() - t0
@@ -1673,8 +1701,7 @@ def recover_pending():
         name = os.path.basename(fp)
         try:
             data, sr = sf.read(fp, dtype="int16")
-            bio = io.BytesIO()
-            sf.write(bio, data, sr, format="wav")
+            bio = encode_upload(data, sr)
             text, err = transcribe_bytes(bio, len(data) / float(sr))
             if text and not err:
                 # mesmo passe do ditado normal (a duracao sai do proprio wav)
