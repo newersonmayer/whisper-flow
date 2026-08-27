@@ -450,11 +450,19 @@ def read_prefs():
     for path in (PREFS_PATH, PREFS_EXAMPLE):
         try:
             with open(path, encoding="utf-8") as f:
-                txt = f.read().strip()
-            if txt:
-                return txt[:4000]
+                txt = f.read()
         except OSError:
             continue
+        # Linha "#" e comentario do arquivo (o cabecalho que explica pro usuario
+        # a diferenca entre vocabulario, correcoes e preferencias). Pro modelo
+        # e peso morto: eram ~1.300 dos 2.997 chars do preferencias.txt, em
+        # TODO ditado. Medido em 27/08/2026, 5 rodadas cada: tirar baixou o
+        # passe de 2,71s pra 2,49s. O "#" ja era comentario por convencao no
+        # .example — preferencia de verdade se escreve em linha "-".
+        txt = "\n".join(l for l in txt.splitlines() if not l.lstrip().startswith("#"))
+        txt = re.sub(r"\n{3,}", "\n\n", txt).strip()
+        if txt:
+            return txt[:4000]
     return ""
 
 
@@ -531,10 +539,15 @@ def normalizar_texto(texto, duracao):
                     vocab=read_vocab() or "(sem glossário)", prefs=prefs)},
                 {"role": "user", "content": texto},
             ],
-            # 'low' porque o passe e reescrita, nao raciocinio: cortou 26% da
-            # latencia (7,2s -> 5,3s) sem perder qualidade, uma vez que a regra
-            # 1-B esta no prompt. 'minimal' nao e suportado por este modelo.
-            reasoning_effort="low",
+            # 'none' porque o passe e reescrita, nao raciocinio. O 'low' ja
+            # tinha cortado 26% (7,2s -> 5,3s) do default; medido de novo em
+            # 27/08/2026 (5 rodadas cada, mesmo texto de 689 chars), 'none'
+            # baixa de 2,94s pra 2,71s e sai mais ESTAVEL — max 2,86s contra
+            # 4,60s do 'low'. Nao muda custo: reasoning_tokens ja era 0 nos
+            # dois, o que o 'low' gastava era latencia, nao token. A regra 1-B
+            # no prompt continua sendo o que segura a qualidade.
+            # 'minimal' segue rejeitado por este modelo (HTTP 400).
+            reasoning_effort="none",
             timeout=NORMALIZE_TIMEOUT_S,
         )
         novo = (r.choices[0].message.content or "").strip()
