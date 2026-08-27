@@ -16,6 +16,7 @@ import json
 import glob
 import math
 import time
+import queue
 import shutil
 import socket
 import subprocess
@@ -233,6 +234,7 @@ hf_window = None
 popup = None
 
 _frames = []
+_enc = None      # _StreamEncoder do ditado em curso (None fora de gravacao)
 _stream = None
 _recording = False   # estado LOGICO: o usuario mandou gravar (vira True na hora)
 _capturing = False   # estado FISICO: o callback do PortAudio esta acumulando frames
@@ -1259,13 +1261,88 @@ def _focus_and_paste(text, hwnd):
     paste(text)
 
 
+class _StreamEncoder:
+    """Encoda o audio em Opus ENQUANTO o usuario fala, numa thread propria.
+
+    O encode custa ~8,8ms por segundo de fala (medido 27/08/2026: 501ms num
+    ditado de 57s, linear e sem custo de primeira chamada). Feito so no fim,
+    esse tempo entra INTEIRO na espera do usuario — 22% do orcamento de um
+    ditado de 1 minuto. Feito durante a fala, ele cabe no tempo ocioso (0,9%
+    de ocupacao) e o custo ao soltar a tecla e ~0.
+
+    ⚠️ O _frames global NAO e tocado: esta classe recebe copia por uma fila e
+    mantem sua propria contagem de amostras. Se a contagem nao bater com o
+    audio final — bloco perdido na janela entre o append e o put, thread
+    morta, erro do codec — o worker joga este buffer fora e encoda do jeito
+    antigo. Por construcao, um defeito aqui ATRASA o ditado; nunca corrompe o
+    audio nem perde a fala. E a mesma disciplina do fail-open do
+    normalizar_texto: o caminho rapido nunca pode custar um ditado.
+    """
+
+    def __init__(self):
+        self.q = queue.Queue()
+        self.bio = io.BytesIO()
+        self.frames = 0
+        self.ok = True
+        self.thread = threading.Thread(target=self._run, daemon=True)
+        self.thread.start()
+
+    def put(self, bloco):
+        if self.ok:
+            self.q.put(bloco)
+
+    def _run(self):
+        fh = None
+        try:
+            fh = sf.SoundFile(self.bio, mode="w", samplerate=SR, channels=1,
+                              format=UPLOAD_FORMAT, subtype=UPLOAD_SUBTYPE)
+            while True:
+                bloco = self.q.get()
+                if bloco is None:
+                    break
+                fh.write(bloco)
+                self.frames += len(bloco)
+            fh.close()      # so aqui o Ogg ganha o trailer; o BytesIO sobrevive
+        except Exception as e:
+            self.ok = False
+            if fh is not None:
+                try:
+                    fh.close()
+                except Exception:
+                    pass
+            log(f"[enc] encode em streaming falhou ({str(e)[:70]}); encodando no fim")
+
+    def finish(self, esperado, tmo=3.0):
+        """Fecha e devolve o buffer, ou None se nao der pra confiar nele."""
+        self.q.put(None)
+        self.thread.join(tmo)
+        if self.thread.is_alive():
+            self.ok = False
+            log("[enc] thread do encode nao terminou a tempo; encodando no fim")
+            return None
+        if not self.ok:
+            return None
+        if self.frames != esperado:
+            log(f"[enc] streaming pegou {self.frames} de {esperado} amostras; encodando no fim")
+            return None
+        self.bio.seek(0)
+        return self.bio
+
+
 def _audio_callback(indata, frames_count, time_info, status):
     """Roda na thread do PortAudio. Com o stream persistente ele fica vivo mesmo
     fora do ditado — por isso so acumula quando _capturing esta ligado."""
     global _last_level
     if not _capturing:
         return
-    _frames.append(indata.copy())
+    # enc lido ANTES do append: se o _end_capture entrar no meio, o bloco cai
+    # so num dos dois lados e a contagem do finish() nao bate — o worker cai
+    # no encode do fim, que e lento mas correto. Ver _StreamEncoder.
+    enc = _enc
+    bloco = indata.copy()
+    _frames.append(bloco)
+    if enc is not None:
+        enc.put(bloco)
     rms = float(np.sqrt(np.mean(indata.astype(np.float32) ** 2))) / 32768.0
     _last_level = min(1.0, rms * 70.0)   # ganho p/ a onda encher (fala ~0.005-0.02)
 
@@ -1333,7 +1410,7 @@ def _stream_keeper():
 def _begin_capture():
     """Liga a captura. BLOQUEIA enquanto abre o dispositivo — roda sempre numa
     thread, nunca na da UI. Retorna False se o microfone nao abriu."""
-    global _frames, _last_level, _capturing, _warm_until
+    global _frames, _enc, _last_level, _capturing, _warm_until
     with _capture_lock:
         warmup_api(quiet=True)   # esquenta a conexao ENQUANTO o usuario fala
         if not _ensure_stream():
@@ -1344,6 +1421,7 @@ def _begin_capture():
             return False
         beep(880)   # so apita quando a captura de fato comecou
         _frames = []
+        _enc = _StreamEncoder()
         _last_level = 0.0
         _warm_until = time.time() + MIC_WARM_S
         _capturing = True
@@ -1358,16 +1436,17 @@ def _end_capture():
     """Desliga a captura e devolve os frames por valor (evita a race do _frames
     global). O _capture_lock faz o stop ESPERAR um begin em curso: ditado curto
     pode soltar a tecla antes de o dispositivo ter aberto."""
-    global _frames, _capturing, _warm_until
+    global _frames, _enc, _capturing, _warm_until
     with _capture_lock:
         was = _capturing
         _capturing = False
         frames, _frames = _frames, []
+        enc, _enc = _enc, None
         _warm_until = time.time() + MIC_WARM_S
         if was:
             unmute_system()   # pareado com o mute_system, sob o mesmo lock
             beep(440)
-    return frames
+    return frames, enc
 
 
 def slot_handsfree_toggle():
@@ -1401,7 +1480,8 @@ def _start_audio(mode):
 
 def _stop_and_transcribe(mode="hold", target_hwnd=None):
     """Fecha a captura (esperando um begin em curso) e transcreve. Fora da UI."""
-    worker(_end_capture(), mode=mode, target_hwnd=target_hwnd)
+    frames, enc = _end_capture()
+    worker(frames, mode=mode, target_hwnd=target_hwnd, enc=enc)
 
 
 def slot_abort(mode):
@@ -1604,7 +1684,7 @@ def _emit_done(mode, secs):
         bridge.done.emit(secs)
 
 
-def worker(frames, mode="hold", target_hwnd=None):
+def worker(frames, mode="hold", target_hwnd=None, enc=None):
     try:
         if not frames:
             _emit_done(mode, -1.0)
@@ -1629,7 +1709,11 @@ def worker(frames, mode="hold", target_hwnd=None):
 
         log(f"Transcrevendo {duration:.1f}s...")
         t_enc = time.time()
-        bio = encode_upload(audio)
+        # caminho normal: o _StreamEncoder ja encodou durante a fala e aqui so
+        # sobra fechar o container. So encoda agora se ele nao deu pra confiar.
+        bio = enc.finish(len(audio)) if enc is not None else None
+        if bio is None:
+            bio = encode_upload(audio)
         t0 = time.time()
         text, err = transcribe_bytes(bio, duration)
         elapsed = time.time() - t0
