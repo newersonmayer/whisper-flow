@@ -800,6 +800,24 @@ def _draw_pill(p, w, h, mode, levels, rec_start, msg="", note=""):
                Qt.AlignVCenter | Qt.AlignRight, txt)
 
 
+def _reposicionar_no_rodape(window):
+    """Centraliza uma pill na área útil atual do monitor sob o cursor."""
+    area = plataforma.area_trabalho_do_cursor()
+    if area is None:
+        # O macOS continua pelo Qt. No Windows este também é o fallback seguro
+        # se a consulta nativa falhar por qualquer motivo.
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
+        scr = screen.availableGeometry()
+        area = (scr.x(), scr.y(), scr.width(), scr.height())
+
+    left, top, width, height = area
+    x = left + (width - window.width()) // 2
+    y = top + height - window.height() - 14
+    x = max(left, min(x, left + width - window.width()))
+    y = max(top, min(y, top + height - window.height()))
+    window.move(x, y)
+
+
 class Overlay(QWidget):
     """Pill flutuante embaixo da tela. Estados: rec (onda + timer), busy
     (spinner + "transcrevendo"), done ("colado" verde) e fail (erro vermelho).
@@ -840,20 +858,7 @@ class Overlay(QWidget):
         self.update()
 
     def reposition(self):
-        # Fica no monitor onde o cursor esta (setup multi-monitor): o overlay
-        # segue a tela ATIVA em vez de ficar preso na primaria. Antes, ancorado
-        # em primaryScreen(), ele (a) aparecia na tela errada quando o foco
-        # estava em outro monitor e (b) apos hot-plug de monitor o Qt do processo
-        # ja rodando reportava geometria stale da primaria e a pill caia fora da
-        # area visivel (ex: y=1822 abaixo da borda do primario -> sumia).
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        scr = screen.availableGeometry()
-        x = scr.x() + (scr.width() - self.width()) // 2
-        y = scr.y() + scr.height() - self.height() - 14
-        # clamp defensivo: a pill nunca sai da area visivel da tela escolhida
-        x = max(scr.x(), min(x, scr.x() + scr.width() - self.width()))
-        y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
-        self.move(x, y)
+        _reposicionar_no_rodape(self)
 
     def _active_note(self):
         """A nota so vale ate note_until. Nao precisa de QTimer: o repaint de
@@ -1003,13 +1008,7 @@ class HandsFreeWindow(QWidget):
         self.update()
 
     def reposition(self):
-        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
-        scr = screen.availableGeometry()
-        x = scr.x() + (scr.width() - self.width()) // 2
-        y = scr.y() + scr.height() - self.height() - 14
-        x = max(scr.x(), min(x, scr.x() + scr.width() - self.width()))
-        y = max(scr.y(), min(y, scr.y() + scr.height() - self.height()))
-        self.move(x, y)
+        _reposicionar_no_rodape(self)
 
     def _active_note(self):
         """A nota so vale ate note_until. Nao precisa de QTimer: o repaint de

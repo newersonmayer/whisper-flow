@@ -128,6 +128,73 @@ def focar_janela(handle):
         pass
 
 
+def area_trabalho_do_cursor():
+    """Área útil atual do monitor sob o cursor como (x, y, largura, altura).
+
+    No Windows a consulta é feita direto no user32 a cada exibição. O processo
+    do ditador fica vivo por dias e o QScreen pode manter a posição antiga de
+    um monitor após hot-plug, rotação ou rearranjo — exatamente quando a pill
+    acabava abaixo da tela apesar de o Qt dizer que ela estava visível.
+
+    Nos outros sistemas devolve None para o chamador usar a geometria do Qt.
+    """
+    if not IS_WIN:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class POINT(ctypes.Structure):
+            _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+        class RECT(ctypes.Structure):
+            _fields_ = [
+                ("left", wintypes.LONG),
+                ("top", wintypes.LONG),
+                ("right", wintypes.LONG),
+                ("bottom", wintypes.LONG),
+            ]
+
+        class MONITORINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.DWORD),
+                ("rcMonitor", RECT),
+                ("rcWork", RECT),
+                ("dwFlags", wintypes.DWORD),
+            ]
+
+        user32 = ctypes.windll.user32
+        user32.GetCursorPos.argtypes = [ctypes.POINTER(POINT)]
+        user32.GetCursorPos.restype = wintypes.BOOL
+        user32.MonitorFromPoint.argtypes = [POINT, wintypes.DWORD]
+        user32.MonitorFromPoint.restype = ctypes.c_void_p
+        user32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+        user32.GetMonitorInfoW.restype = wintypes.BOOL
+
+        point = POINT()
+        if not user32.GetCursorPos(ctypes.byref(point)):
+            return None
+
+        monitor = user32.MonitorFromPoint(point, 2)  # MONITOR_DEFAULTTONEAREST
+        if not monitor:
+            return None
+
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(info)
+        if not user32.GetMonitorInfoW(monitor, ctypes.byref(info)):
+            return None
+
+        work = info.rcWork
+        return (
+            work.left,
+            work.top,
+            work.right - work.left,
+            work.bottom - work.top,
+        )
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # Diagnostico (usado pelo instalador e pelo log de boot)
 # --------------------------------------------------------------------------
