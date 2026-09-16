@@ -1359,6 +1359,18 @@ def _audio_callback(indata, frames_count, time_info, status):
     _last_level = min(1.0, rms * 70.0)   # ganho p/ a onda encher (fala ~0.005-0.02)
 
 
+def _dispose_stream(s):
+    """Descarta um stream sob _stream_lock, mesmo se stop falhar."""
+    try:
+        s.stop()
+    except Exception as e:
+        log(f"[audio] parar microfone falhou: {e}")
+    try:
+        s.close()
+    except Exception as e:
+        log(f"[audio] fechar microfone falhou: {e}")
+
+
 def _ensure_stream():
     """Abre o InputStream se preciso. BLOQUEIA (dispositivo frio leva ate 5s) —
     NUNCA chamar da thread da UI: era exatamente isso que congelava a pill."""
@@ -1371,40 +1383,53 @@ def _ensure_stream():
             except Exception:
                 pass
             # stream morto (mic trocado/desconectado): descarta e reabre
+            _dispose_stream(_stream)
+            _stream = None
+        for tentativa in (1, 2):
+            s = None
             try:
-                _stream.stop()
-                _stream.close()
-            except Exception:
-                pass
-            _stream = None
-        try:
-            t0 = time.perf_counter()
-            s = sd.InputStream(samplerate=SR, channels=1, dtype="int16",
-                               blocksize=BLOCK, callback=_audio_callback)
-            s.start()
-            _stream = s
-            _warm_until = time.time() + MIC_WARM_S   # o keeper so fecha depois disso
-            ms = (time.perf_counter() - t0) * 1000
-            if ms > 300:
-                log(f"[t] abrir microfone {ms:.0f}ms (estava frio)")
-            return True
-        except Exception as e:
-            log(f"abrir microfone falhou: {e}")
-            _stream = None
-            return False
+                t0 = time.perf_counter()
+                s = sd.InputStream(samplerate=SR, channels=1, dtype="int16",
+                                   blocksize=BLOCK, callback=_audio_callback)
+                s.start()
+                _stream = s
+                _warm_until = time.time() + MIC_WARM_S
+                ms = (time.perf_counter() - t0) * 1000
+                if ms > 300:
+                    log(f"[t] abrir microfone {ms:.0f}ms (estava frio)")
+                return True
+            except Exception as e:
+                log(f"abrir microfone falhou (tentativa {tentativa}/2): {e}")
+                if s is not None:
+                    _dispose_stream(s)
+                if tentativa == 2:
+                    return False
+                # Bluetooth/suspensao podem invalidar o estado do PortAudio.
+                # Expert Mode do sounddevice 0.5.5: reinicializar e tentar UMA
+                # vez, sem outro open/stop/close concorrente neste processo.
+                try:
+                    sd._terminate()
+                    sd._initialize()
+                    log("[audio] PortAudio reiniciado; tentando abrir microfone novamente")
+                except Exception as reset_error:
+                    log(f"[audio] reiniciar PortAudio falhou: {reset_error}")
+                    return False
+        return False
 
 
-def _close_stream():
+def _close_stream(*, only_if_idle=False):
     global _stream
-    with _stream_lock:
-        s, _stream = _stream, None
-    if s is None:
-        return
-    try:
-        s.stop()
-        s.close()
-    except Exception:
-        pass
+    # Mesma ordem de _begin_capture: capture -> stream. O keeper revalida
+    # a ociosidade aqui para nao fechar uma captura que acabou de comecar.
+    with _capture_lock:
+        with _stream_lock:
+            if only_if_idle and (_capturing or time.time() <= _warm_until):
+                return
+            s, _stream = _stream, None
+            if s is not None:
+                # Open/close concorrentes nao sao seguros no PortAudio.
+                # Manter o lock ate o fim evita o travamento relatado no macOS.
+                _dispose_stream(s)
 
 
 def _stream_keeper():
@@ -1413,10 +1438,9 @@ def _stream_keeper():
     while True:
         time.sleep(5)
         try:
-            if _stream is not None and not _capturing and time.time() > _warm_until:
-                _close_stream()
-        except Exception:
-            pass
+            _close_stream(only_if_idle=True)
+        except Exception as e:
+            log(f"[audio] verificar ociosidade do microfone falhou: {e}")
 
 
 def _begin_capture():
