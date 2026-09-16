@@ -92,6 +92,29 @@ def modificador_de_colar(keyboard):
     return keyboard.Key.cmd if IS_MAC else keyboard.Key.ctrl
 
 
+def tecla_pressionada(key):
+    """Estado fisico de uma tecla de atalho no Windows; None fora dele.
+
+    Chamado ANTES de processar o novo evento do hook. O Windows ainda nao
+    atualizou o estado assincrono da tecla desse evento, mas ja conhece o
+    estado das outras teclas que o listener guardou.
+    """
+    if not IS_WIN:
+        return None
+    vk = {
+        "ctrl": 0x11, "ctrl_l": 0xA2, "ctrl_r": 0xA3,
+        "alt": 0x12, "alt_l": 0xA4, "alt_r": 0xA5, "alt_gr": 0xA5,
+        "space": 0x20,
+    }.get(getattr(key, "name", None))
+    if vk is None:
+        return None
+    try:
+        import ctypes
+        return bool(ctypes.windll.user32.GetAsyncKeyState(vk) & 0x8000)
+    except Exception:
+        return None
+
+
 # --------------------------------------------------------------------------
 # Janela em foco (alvo do auto-paste do modo maos-livres)
 # --------------------------------------------------------------------------

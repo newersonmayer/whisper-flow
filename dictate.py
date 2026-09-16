@@ -674,7 +674,8 @@ class Bridge(QObject):
     start = pyqtSignal()
     stop = pyqtSignal()
     done = pyqtSignal(float)   # segundos da transcricao; <0 = sem texto/erro
-    handsfree_toggle = pyqtSignal()   # aperto do atalho maos-livres OU clique no Parar
+    handsfree_toggle = pyqtSignal()   # aperto do atalho maos-livres
+    handsfree_stop = pyqtSignal()     # clique no Parar nunca pode iniciar uma gravacao
     handsfree_cancel = pyqtSignal()   # ESC: descarta sem transcrever
     handsfree_done = pyqtSignal(float)   # segundos; <0 = erro/vazio (pill maos-livres)
     popup = pyqtSignal(str, float)    # (texto, segundos) -> ResultPopup (thread da UI)
@@ -959,8 +960,7 @@ class HandsFreeWindow(QWidget):
     foco (WS_EX_NOACTIVATE via WindowDoesNotAcceptFocus + WA_ShowWithoutActivating)
     — recebe clique de mouse sem ativar, o que faz o auto-paste cair na janela de
     tras, nao nela. Estados: rec (onda+timer+Parar), busy (transcrevendo), done
-    ("colado") e fail (erro). Parar e a hotkey de novo fazem a mesma coisa
-    (toggle), ambos via bridge.handsfree_toggle."""
+    ("colado") e fail (erro). A hotkey alterna; o botao Parar so encerra."""
 
     PILL_W, PILL_H = Overlay.W, Overlay.H   # pill exatamente do tamanho do overlay
     GAP = 8
@@ -996,7 +996,7 @@ class HandsFreeWindow(QWidget):
         )
         # botao ao lado da pill (a pill ocupa a esquerda PILL_W; botao a direita)
         self.btn.setGeometry(self.PILL_W + self.GAP, 2, self.BTN_W, self.H - 4)
-        self.btn.clicked.connect(lambda: bridge.handsfree_toggle.emit())
+        self.btn.clicked.connect(lambda: bridge.handsfree_stop.emit())
 
         self._repaint = QTimer(self)
         self._repaint.setInterval(33)
@@ -1462,7 +1462,7 @@ def _end_capture():
 
 
 def slot_handsfree_toggle():
-    """Aperto do atalho OU clique no Parar. Decide start/stop conforme o estado.
+    """Aperto do atalho. Decide start/stop conforme o estado.
     Um ditado por vez: se o hold-to-talk grava, ignora."""
     if _recording and _rec_mode == "hold":
         return
@@ -1470,6 +1470,11 @@ def slot_handsfree_toggle():
         _handsfree_stop()
     elif not _recording:
         _handsfree_start()
+
+
+def slot_handsfree_stop():
+    """O botao Parar so encerra; um clique atrasado nao inicia outro ditado."""
+    _handsfree_stop()
 
 
 def _start_audio(mode):
@@ -1847,8 +1852,25 @@ def _handsfree_held():
     return all(_pressed & token for token in HANDSFREE_HOTKEY)
 
 
+def _reconcile_handsfree_pressed():
+    """Descarta teclas do chord cujo key-up o hook nao recebeu no Windows.
+
+    Roda antes de adicionar a tecla do evento atual: GetAsyncKeyState ainda
+    reflete o estado anterior dessa tecla dentro do callback do hook.
+    """
+    global _handsfree_combo_active
+    chord_keys = set().union(*HANDSFREE_HOTKEY)
+    for held in tuple(_pressed & chord_keys):
+        if plataforma.tecla_pressionada(held) is False:
+            _pressed.discard(held)
+            log(f"[hotkey] soltura ausente: {getattr(held, 'name', held)}")
+    if _handsfree_combo_active and not _handsfree_held():
+        _handsfree_combo_active = False
+
+
 def on_press(key):
     global _t_press, _handsfree_combo_active, _hold_combo_active
+    _reconcile_handsfree_pressed()
     _pressed.add(key)
 
     # hold-to-talk (edge-triggered NA THREAD DO HOOK): a trava fecha aqui, na
@@ -1956,6 +1978,7 @@ def main():
     bridge.stop.connect(slot_stop)
     bridge.done.connect(overlay.show_done)
     bridge.handsfree_toggle.connect(slot_handsfree_toggle)
+    bridge.handsfree_stop.connect(slot_handsfree_stop)
     bridge.handsfree_cancel.connect(slot_handsfree_cancel)
     bridge.handsfree_done.connect(hf_window.show_done)
     bridge.popup.connect(popup.show_text)
