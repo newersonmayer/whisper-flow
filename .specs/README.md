@@ -5,3 +5,4 @@
 | # | Spec | Resumo |
 |---|---|---|
 | [#01](#01-modo-maos-livres/overview.md) | Modo mãos-livres | Atalho global (`Ctrl+Alt+Space`) abre pill flutuante já gravando, botão Parar / toggle, ESC cancela, transcreve → cola no cursor → fecha sozinha. Reusa o pipeline do `dictate.py`. |
+| [#05](#05-microfone-sem-resposta/overview.md) | Microfone que não responde | Watchdog reinicia o processo quando uma chamada ao driver de áudio passa de 15s; captura que não confirma em 3s vira `✕ microfone não abriu` com bipe; geração por ditado impede abertura atrasada de capturar o ditado seguinte. |

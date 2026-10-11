@@ -14,20 +14,29 @@ def load_audio_functions():
     # Executa as funcoes de producao sem os efeitos colaterais dos imports.
     names = {
         "_dispose_stream", "_ensure_stream", "_close_stream", "_stream_keeper",
-        "_begin_capture", "_end_capture",
+        "_begin_capture", "_end_capture", "_start_audio", "_confirmar_captura",
+        "_no_driver", "_chamada_travada", "_vigia_do_driver",
     }
     tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
     tree.body = [node for node in tree.body
                  if isinstance(node, ast.FunctionDef) and node.name in names]
+    # Estado de partida: o aperto 1 acabou de acontecer e espera o microfone.
     state = dict(
         _stream=None, _stream_lock=threading.Lock(),
-        _capture_lock=threading.Lock(), _capturing=False, _recording=True,
+        _capture_lock=threading.Lock(), _state_lock=threading.Lock(),
+        _capturing=False, _recording=True, _rec_mode="hold",
+        _rec_gen=1, _cap_gen=None, _begins_pendentes={1},
         _warm_until=0, MIC_WARM_S=180, SR=16000, BLOCK=1024,
+        MIC_CONFIRM_S=3, MIC_NATIVE_TIMEOUT_S=15, EXIT_DRIVER_TRAVADO=75,
+        _nativo=None,
         _frames=[], _enc=None, _last_level=0,
         _audio_callback=Mock(), sd=Mock(), log=Mock(),
-        time=SimpleNamespace(time=lambda: 1000, perf_counter=lambda: 0),
+        time=SimpleNamespace(time=lambda: 1000, perf_counter=lambda: 0,
+                             monotonic=lambda: 100),
+        os=SimpleNamespace(_exit=Mock(side_effect=SystemExit)),
         warmup_api=Mock(), beep=Mock(), _StreamEncoder=Mock(),
         mute_system=Mock(), unmute_system=Mock(),
+        overlay=Mock(), hf_window=Mock(), bridge=Mock(),
     )
     exec(compile(tree, str(SOURCE), "exec"), state)
     return state
@@ -149,7 +158,7 @@ class AudioLifecycleTest(unittest.TestCase):
         thread.start()
         try:
             self.assertTrue(waiting.wait(1))
-            self.assertTrue(self.g["_begin_capture"]())
+            self.assertTrue(self.g["_begin_capture"](1))
         finally:
             release.set()
             thread.join(2)
@@ -204,9 +213,145 @@ class AudioLifecycleTest(unittest.TestCase):
             self.g["_recording"] = False
             return Mock(active=True)
         self.sd.InputStream.side_effect = open_stream
-        self.assertFalse(self.g["_begin_capture"]())
+        self.assertFalse(self.g["_begin_capture"](1))
         self.assertFalse(self.g["_capturing"])
         self.g["mute_system"].assert_not_called()
+
+
+class DriverWatchdogTest(unittest.TestCase):
+    """Chamada ao PortAudio sem prazo prendia o ditado para sempre (#05)."""
+
+    def setUp(self):
+        self.g = load_audio_functions()
+
+    def test_stop_hung_past_deadline_is_reported_with_its_phase(self):
+        seen = {}
+        stream = Mock()
+        def stop():
+            seen["no prazo"] = self.g["_chamada_travada"](100 + 15)
+            seen["vencida"] = self.g["_chamada_travada"](100 + 16)
+        stream.stop.side_effect = stop
+        self.g["_stream"] = stream
+        self.g["_close_stream"]()
+        self.assertIsNone(seen["no prazo"])
+        self.assertEqual(seen["vencida"], ("parar microfone", 16))
+        # terminou: nao sobra chamada vigiada
+        self.assertIsNone(self.g["_chamada_travada"](10_000))
+
+    def test_open_and_portaudio_reset_are_watched(self):
+        phases = []
+        def open_stream(**kwargs):
+            phases.append(self.g["_nativo"][0])
+            raise RuntimeError("-9986")
+        self.g["sd"].InputStream.side_effect = open_stream
+        self.g["sd"]._terminate.side_effect = (
+            lambda: phases.append(self.g["_nativo"][0]))
+        self.assertFalse(self.g["_ensure_stream"]())
+        self.assertEqual(phases, ["abrir microfone", "reiniciar PortAudio",
+                                  "abrir microfone"])
+        self.assertIsNone(self.g["_nativo"])
+
+    def test_watchdog_restarts_process_when_a_call_overstays(self):
+        self.g["_nativo"] = ("parar microfone", 100)
+        self.g["time"].monotonic = lambda: 116
+        self.g["time"].sleep = lambda _: None
+        with self.assertRaises(SystemExit):
+            self.g["_vigia_do_driver"]()
+        self.g["os"]._exit.assert_called_once_with(75)
+        self.assertIn("parar microfone", self.g["log"].call_args[0][0])
+
+    def test_watchdog_stays_quiet_within_deadline(self):
+        self.g["_nativo"] = ("abrir microfone", 100)
+        self.g["time"].monotonic = lambda: 110
+        ticks = iter([None, None])
+        self.g["time"].sleep = lambda _: next(ticks)
+        with self.assertRaises(StopIteration):
+            self.g["_vigia_do_driver"]()
+        self.g["os"]._exit.assert_not_called()
+
+
+class CaptureConfirmationTest(unittest.TestCase):
+    """A pill nao pode dizer 'gravando' sem captura por mais de MIC_CONFIRM_S."""
+
+    def setUp(self):
+        self.g = load_audio_functions()
+
+    def test_unconfirmed_capture_is_cancelled_and_reported(self):
+        self.g["_confirmar_captura"](1, "hold")
+        self.assertFalse(self.g["_recording"])
+        self.assertIsNone(self.g["_rec_mode"])
+        self.g["overlay"].show_done.assert_called_once_with(-4.0)
+        self.g["beep"].assert_called_once_with(220, 280)
+
+    def test_handsfree_failure_goes_to_its_own_pill(self):
+        self.g["_rec_mode"] = "handsfree"
+        self.g["_confirmar_captura"](1, "handsfree")
+        self.g["hf_window"].show_done.assert_called_once_with(-4.0)
+        self.g["overlay"].show_done.assert_not_called()
+
+    def test_confirmed_capture_is_left_alone(self):
+        self.assertTrue(self.g["_begin_capture"](1))
+        self.assertNotIn(1, self.g["_begins_pendentes"])
+        self.g["_confirmar_captura"](1, "hold")
+        self.assertTrue(self.g["_recording"])
+        self.assertTrue(self.g["_capturing"])
+        self.g["overlay"].show_done.assert_not_called()
+
+    def test_released_key_gets_the_failure_instead_of_the_spinner(self):
+        self.g.update(_recording=False, _rec_mode=None)
+        self.g["_confirmar_captura"](1, "hold")
+        self.g["overlay"].show_done.assert_called_once_with(-4.0)
+
+    def test_newer_dictation_keeps_the_pill(self):
+        self.g["_rec_gen"] = 2   # o usuario ja apertou de novo; a pill e do 2
+        self.g["_begins_pendentes"].add(2)
+        self.g["_confirmar_captura"](1, "hold")
+        self.assertTrue(self.g["_recording"])
+        self.g["overlay"].show_done.assert_not_called()
+        self.g["beep"].assert_not_called()
+
+    def test_late_open_after_cancel_does_not_capture(self):
+        self.g["_confirmar_captura"](1, "hold")
+        self.assertFalse(self.g["_begin_capture"](1))
+        self.assertFalse(self.g["_capturing"])
+        self.g["mute_system"].assert_not_called()
+
+    def test_late_open_does_not_capture_for_a_newer_press(self):
+        self.g["_rec_gen"] = 2
+        self.assertFalse(self.g["_begin_capture"](1))
+        self.assertIsNone(self.g["_cap_gen"])
+        self.g["mute_system"].assert_not_called()
+
+    def test_stale_stop_does_not_end_a_newer_capture(self):
+        self.g["_rec_gen"] = 2
+        self.assertTrue(self.g["_begin_capture"](2))
+        frames, enc = self.g["_end_capture"](1)
+        self.assertEqual((frames, enc), ([], None))
+        self.assertTrue(self.g["_capturing"])
+        self.g["unmute_system"].assert_not_called()
+
+    def test_own_stop_ends_the_capture(self):
+        self.assertTrue(self.g["_begin_capture"](1))
+        self.g["_frames"].append("bloco")
+        frames, _ = self.g["_end_capture"](1)
+        self.assertEqual(frames, ["bloco"])
+        self.assertFalse(self.g["_capturing"])
+        self.assertIsNone(self.g["_cap_gen"])
+        self.g["unmute_system"].assert_called_once()
+
+    def test_open_failing_after_cancel_does_not_hide_the_failure(self):
+        self.g["sd"].InputStream.side_effect = RuntimeError("no device")
+        self.g["_confirmar_captura"](1, "hold")
+        self.g["_start_audio"]("hold", 1)
+        self.g["bridge"].abort.emit.assert_not_called()
+        self.assertNotIn(1, self.g["_begins_pendentes"])
+
+    def test_open_failing_in_time_aborts_and_skips_confirmation(self):
+        self.g["sd"].InputStream.side_effect = RuntimeError("no device")
+        self.g["_start_audio"]("hold", 1)
+        self.g["bridge"].abort.emit.assert_called_once_with("hold")
+        self.g["_confirmar_captura"](1, "hold")
+        self.g["overlay"].show_done.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -84,6 +84,32 @@ class OverlayPositioningTest(unittest.TestCase):
             read_work_area = getattr(plataforma, "area_trabalho_do_cursor", lambda: None)
             self.assertEqual(read_work_area(), (1920, -510, 1080, 1872))
 
+    def test_both_pills_say_the_microphone_did_not_open(self):
+        # .specs/#05-microfone-sem-resposta/_ux-veredito.md: reaproveita o fail
+        for window_type in (dictate.Overlay, dictate.HandsFreeWindow):
+            with self.subTest(window=window_type.__name__):
+                window = window_type()
+                try:
+                    window.show_done(-4.0)
+                    self.assertEqual((window.mode, window.msg),
+                                     ("fail", "microfone não abriu"))
+                finally:
+                    window.close()
+
+    def test_silent_end_does_not_cut_a_failure_short(self):
+        # O stop do ditado cancelado chega depois do aviso e termina com -1
+        # (sem audio). Esse fim silencioso nao pode apagar o erro da tela.
+        for window_type in (dictate.Overlay, dictate.HandsFreeWindow):
+            with self.subTest(window=window_type.__name__):
+                window = window_type()
+                try:
+                    window.show_done(-4.0)
+                    window.show_done(-1.0)
+                    self.assertTrue(window.isVisible())
+                    self.assertEqual(window.mode, "fail")
+                finally:
+                    window.close()
+
 
 if __name__ == "__main__":
     unittest.main()
