@@ -174,6 +174,12 @@ MUTE_WHILE_RECORDING = True   # silencia a saida de audio enquanto grava
 # nesse intervalo. 0 = fecha na hora (comportamento antigo); numero alto = sempre
 # ligado. Ajustavel pelo .env sem mexer no codigo.
 MIC_WARM_S = float(os.getenv("MIC_WARM_SECONDS", "180"))
+# Prazo de UMA chamada ao driver (abrir/parar/fechar/reiniciar o PortAudio). No
+# CoreAudio o stop() pode esperar para sempre (BlockWhileAudioUnitIsRunning nao
+# tem timeout) e Python nao interrompe chamada C presa: passou disto, o processo
+# se encerra e o supervisor.py religa. ~2x o pior caso medido (7,1s).
+MIC_NATIVE_TIMEOUT_S = float(os.getenv("MIC_NATIVE_TIMEOUT", "15"))
+EXIT_DRIVER_TRAVADO = 75   # aparece no supervisor.log como rc=75
 LOG_PATH = os.path.join(BASE, "dictate.log")
 HIST_DIR = os.path.join(BASE, "transcricoes")
 PEND_DIR = os.path.join(BASE, "pendentes")   # audios salvos antes de transcrever (sobrevivem a quedas)
@@ -246,6 +252,7 @@ _warm_until = 0.0                 # ate quando o stream fica aberto ocioso
 _pressed = set()   # teclas atualmente pressionadas (so a thread do listener mexe)
 _t_press = None    # perf_counter do apertar da tecla -> mede tecla->overlay
 _rec_mode = None   # None | "hold" | "handsfree" — quem esta gravando agora
+_nativo = None   # (fase, inicio em time.monotonic) da chamada ao driver em curso
 _hold_combo_active = False       # True enquanto a HOTKEY do hold esta pressionada (anti-repeat)
 _handsfree_combo_active = False  # True enquanto o chord maos-livres esta 100% pressionado (anti-repeat)
 _hf_target_hwnd = None           # janela em foco quando o atalho maos-livres foi apertado (pro auto-paste)
@@ -1359,14 +1366,56 @@ def _audio_callback(indata, frames_count, time_info, status):
     _last_level = min(1.0, rms * 70.0)   # ganho p/ a onda encher (fala ~0.005-0.02)
 
 
+def _no_driver(fase, fn, *args, **kwargs):
+    """Executa uma chamada ao PortAudio sob o olhar do _vigia_do_driver.
+    Todas acontecem sob _stream_lock, entao ha no maximo uma por vez."""
+    global _nativo
+    _nativo = (fase, time.monotonic())
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _nativo = None
+
+
+def _chamada_travada(agora):
+    """(fase, segundos) da chamada ao driver que estourou o prazo, ou None."""
+    atual = _nativo
+    if atual is None:
+        return None
+    fase, inicio = atual
+    passou = agora - inicio
+    return (fase, passou) if passou > MIC_NATIVE_TIMEOUT_S else None
+
+
+def _vigia_do_driver():
+    """Encerra o processo quando uma chamada ao driver passa do prazo.
+
+    Python nao interrompe uma chamada C presa, e no CoreAudio o stop() pode
+    esperar para sempre. Presa, ela segura o _capture_lock e TODO ditado seguinte
+    fica em "transcrevendo" ate alguem reiniciar o app — foi o que aconteceu no
+    Mac do Eduardo mesmo depois do PR #8. Sair e deixar o supervisor.py religar
+    (~2s) e a unica saida que nao depende do driver colaborar. Nao ha audio a
+    perder: chamada ao driver so acontece fora de captura, e o ditado que ainda
+    estiver transcrevendo ja esta em pendentes/.
+    Decisao: .specs/#05-microfone-sem-resposta/"""
+    while True:
+        time.sleep(1)
+        travada = _chamada_travada(time.monotonic())
+        if travada:
+            fase, passou = travada
+            log(f"[audio] {fase} travou no driver ha {passou:.0f}s; "
+                f"reiniciando o processo (o supervisor religa)")
+            os._exit(EXIT_DRIVER_TRAVADO)
+
+
 def _dispose_stream(s):
     """Descarta um stream sob _stream_lock, mesmo se stop falhar."""
     try:
-        s.stop()
+        _no_driver("parar microfone", s.stop)
     except Exception as e:
         log(f"[audio] parar microfone falhou: {e}")
     try:
-        s.close()
+        _no_driver("fechar microfone", s.close)
     except Exception as e:
         log(f"[audio] fechar microfone falhou: {e}")
 
@@ -1389,9 +1438,10 @@ def _ensure_stream():
             s = None
             try:
                 t0 = time.perf_counter()
-                s = sd.InputStream(samplerate=SR, channels=1, dtype="int16",
-                                   blocksize=BLOCK, callback=_audio_callback)
-                s.start()
+                s = _no_driver("abrir microfone", sd.InputStream,
+                               samplerate=SR, channels=1, dtype="int16",
+                               blocksize=BLOCK, callback=_audio_callback)
+                _no_driver("iniciar microfone", s.start)
                 _stream = s
                 _warm_until = time.time() + MIC_WARM_S
                 ms = (time.perf_counter() - t0) * 1000
@@ -1408,8 +1458,8 @@ def _ensure_stream():
                 # Expert Mode do sounddevice 0.5.5: reinicializar e tentar UMA
                 # vez, sem outro open/stop/close concorrente neste processo.
                 try:
-                    sd._terminate()
-                    sd._initialize()
+                    _no_driver("reiniciar PortAudio", sd._terminate)
+                    _no_driver("reiniciar PortAudio", sd._initialize)
                     log("[audio] PortAudio reiniciado; tentando abrir microfone novamente")
                 except Exception as reset_error:
                     log(f"[audio] reiniciar PortAudio falhou: {reset_error}")
@@ -2027,6 +2077,7 @@ def main():
     # 5s logo apos o boot). Fica quente por MIC_WARM_S e depois o keeper fecha.
     threading.Thread(target=_ensure_stream, daemon=True).start()
     threading.Thread(target=_stream_keeper, daemon=True).start()
+    threading.Thread(target=_vigia_do_driver, daemon=True).start()
 
     # pre-aquece a API (1a chamada fria levava 6-16s vs 1-3s quente) e mantem
     # quente com ping periodico que reusa a conexao do pool

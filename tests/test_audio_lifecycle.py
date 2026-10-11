@@ -15,6 +15,7 @@ def load_audio_functions():
     names = {
         "_dispose_stream", "_ensure_stream", "_close_stream", "_stream_keeper",
         "_begin_capture", "_end_capture",
+        "_no_driver", "_chamada_travada", "_vigia_do_driver",
     }
     tree = ast.parse(SOURCE.read_text(encoding="utf-8-sig"))
     tree.body = [node for node in tree.body
@@ -23,9 +24,12 @@ def load_audio_functions():
         _stream=None, _stream_lock=threading.Lock(),
         _capture_lock=threading.Lock(), _capturing=False, _recording=True,
         _warm_until=0, MIC_WARM_S=180, SR=16000, BLOCK=1024,
+        MIC_NATIVE_TIMEOUT_S=15, EXIT_DRIVER_TRAVADO=75, _nativo=None,
         _frames=[], _enc=None, _last_level=0,
         _audio_callback=Mock(), sd=Mock(), log=Mock(),
-        time=SimpleNamespace(time=lambda: 1000, perf_counter=lambda: 0),
+        time=SimpleNamespace(time=lambda: 1000, perf_counter=lambda: 0,
+                             monotonic=lambda: 100),
+        os=SimpleNamespace(_exit=Mock(side_effect=SystemExit)),
         warmup_api=Mock(), beep=Mock(), _StreamEncoder=Mock(),
         mute_system=Mock(), unmute_system=Mock(),
     )
@@ -207,6 +211,58 @@ class AudioLifecycleTest(unittest.TestCase):
         self.assertFalse(self.g["_begin_capture"]())
         self.assertFalse(self.g["_capturing"])
         self.g["mute_system"].assert_not_called()
+
+
+class DriverWatchdogTest(unittest.TestCase):
+    """Chamada ao PortAudio sem prazo prendia o ditado para sempre (#05)."""
+
+    def setUp(self):
+        self.g = load_audio_functions()
+
+    def test_stop_hung_past_deadline_is_reported_with_its_phase(self):
+        seen = {}
+        stream = Mock()
+        def stop():
+            seen["no prazo"] = self.g["_chamada_travada"](100 + 15)
+            seen["vencida"] = self.g["_chamada_travada"](100 + 16)
+        stream.stop.side_effect = stop
+        self.g["_stream"] = stream
+        self.g["_close_stream"]()
+        self.assertIsNone(seen["no prazo"])
+        self.assertEqual(seen["vencida"], ("parar microfone", 16))
+        # terminou: nao sobra chamada vigiada
+        self.assertIsNone(self.g["_chamada_travada"](10_000))
+
+    def test_open_and_portaudio_reset_are_watched(self):
+        phases = []
+        def open_stream(**kwargs):
+            phases.append(self.g["_nativo"][0])
+            raise RuntimeError("-9986")
+        self.g["sd"].InputStream.side_effect = open_stream
+        self.g["sd"]._terminate.side_effect = (
+            lambda: phases.append(self.g["_nativo"][0]))
+        self.assertFalse(self.g["_ensure_stream"]())
+        self.assertEqual(phases, ["abrir microfone", "reiniciar PortAudio",
+                                  "abrir microfone"])
+        self.assertIsNone(self.g["_nativo"])
+
+    def test_watchdog_restarts_process_when_a_call_overstays(self):
+        self.g["_nativo"] = ("parar microfone", 100)
+        self.g["time"].monotonic = lambda: 116
+        self.g["time"].sleep = lambda _: None
+        with self.assertRaises(SystemExit):
+            self.g["_vigia_do_driver"]()
+        self.g["os"]._exit.assert_called_once_with(75)
+        self.assertIn("parar microfone", self.g["log"].call_args[0][0])
+
+    def test_watchdog_stays_quiet_within_deadline(self):
+        self.g["_nativo"] = ("abrir microfone", 100)
+        self.g["time"].monotonic = lambda: 110
+        ticks = iter([None, None])
+        self.g["time"].sleep = lambda _: next(ticks)
+        with self.assertRaises(StopIteration):
+            self.g["_vigia_do_driver"]()
+        self.g["os"]._exit.assert_not_called()
 
 
 if __name__ == "__main__":
