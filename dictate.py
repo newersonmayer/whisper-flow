@@ -174,6 +174,12 @@ MUTE_WHILE_RECORDING = True   # silencia a saida de audio enquanto grava
 # nesse intervalo. 0 = fecha na hora (comportamento antigo); numero alto = sempre
 # ligado. Ajustavel pelo .env sem mexer no codigo.
 MIC_WARM_S = float(os.getenv("MIC_WARM_SECONDS", "180"))
+# A pill aparece na hora do aperto, antes de o microfone abrir. Se a captura nao
+# comecar neste prazo, o ditado e cancelado com aviso — sem isso a pill contava
+# tempo sem gravar nada (2 min perdidos no Mac do Eduardo, 10/10/2026). Medido
+# no dictate.log: 5 de ~4.600 ditados abriram o microfone em mais de 3s.
+# Decisao: .specs/#05-microfone-sem-resposta/
+MIC_CONFIRM_S = float(os.getenv("MIC_CONFIRM_SECONDS", "3"))
 # Prazo de UMA chamada ao driver (abrir/parar/fechar/reiniciar o PortAudio). No
 # CoreAudio o stop() pode esperar para sempre (BlockWhileAudioUnitIsRunning nao
 # tem timeout) e Python nao interrompe chamada C presa: passou disto, o processo
@@ -252,6 +258,13 @@ _warm_until = 0.0                 # ate quando o stream fica aberto ocioso
 _pressed = set()   # teclas atualmente pressionadas (so a thread do listener mexe)
 _t_press = None    # perf_counter do apertar da tecla -> mede tecla->overlay
 _rec_mode = None   # None | "hold" | "handsfree" — quem esta gravando agora
+# Geracao do ditado: cada aperto ganha um numero (sob _state_lock). Uma abertura
+# atrasada so captura se ainda for a do aperto atual, e um stop so encerra a
+# captura que e dele — senao o start que ficou esperando o microfone gravava em
+# nome do ditado SEGUINTE e mutava o PC duas vezes.
+_rec_gen = 0
+_cap_gen = None            # geracao dona da captura em curso (None = nenhuma)
+_begins_pendentes = set()  # geracoes cujo start ainda nao resolveu (abriu ou falhou)
 _nativo = None   # (fase, inicio em time.monotonic) da chamada ao driver em curso
 _hold_combo_active = False       # True enquanto a HOTKEY do hold esta pressionada (anti-repeat)
 _handsfree_combo_active = False  # True enquanto o chord maos-livres esta 100% pressionado (anti-repeat)
@@ -928,8 +941,15 @@ class Overlay(QWidget):
             self._flash("fail", "falhou — audio guardado pra retry", 1600)
         elif secs == -3.0:
             self._flash("fail", "nao entendi nada", 1200)
-        else:
-            self.hide_it()   # curto/sem audio: some em silencio, como antes
+        elif secs == -4.0:
+            # captura nao confirmou: mais longo que os outros porque chega no
+            # meio da fala, com a atencao no texto e nao na pill.
+            # Decisao: .specs/#05-microfone-sem-resposta/_ux-veredito.md
+            self._flash("fail", "microfone não abriu", 2400)
+        elif self.mode != "fail":
+            # curto/sem audio: some em silencio, como antes — mas nao apaga um
+            # erro ainda na tela (o stop do ditado cancelado chega depois dele)
+            self.hide_it()
 
     def _flash(self, mode, msg, ms):
         self.mode = mode
@@ -1076,7 +1096,10 @@ class HandsFreeWindow(QWidget):
             self._flash("fail", "falhou — audio guardado pra retry", 1600)
         elif secs == -3.0:
             self._flash("fail", "nao entendi nada", 1200)
-        else:
+        elif secs == -4.0:
+            # mesmo aviso do Overlay (ver la)
+            self._flash("fail", "microfone não abriu", 2400)
+        elif self.mode != "fail":
             self.hide_it()
 
     def _flash(self, mode, msg, ms):
@@ -1493,18 +1516,25 @@ def _stream_keeper():
             log(f"[audio] verificar ociosidade do microfone falhou: {e}")
 
 
-def _begin_capture():
-    """Liga a captura. BLOQUEIA enquanto abre o dispositivo — roda sempre numa
-    thread, nunca na da UI. Retorna False se o microfone nao abriu."""
-    global _frames, _enc, _last_level, _capturing, _warm_until
+def _begin_capture(gen):
+    """Liga a captura do aperto `gen`. BLOQUEIA enquanto abre o dispositivo —
+    roda sempre numa thread, nunca na da UI. Retorna False se o microfone nao
+    abriu ou se este aperto deixou de ser o atual."""
+    global _frames, _enc, _last_level, _capturing, _warm_until, _cap_gen
     with _capture_lock:
         warmup_api(quiet=True)   # esquenta a conexao ENQUANTO o usuario fala
         if not _ensure_stream():
             return False
-        # ditado curtissimo: a tecla pode ter sido solta enquanto o dispositivo
-        # abria. Nao liga uma captura orfa — o _end_capture dela ja passou.
-        if not _recording:
-            return False
+        # Enquanto o dispositivo abria, a tecla pode ter sido solta, o prazo de
+        # confirmacao pode ter vencido ou outro ditado pode ter comecado. So o
+        # aperto ATUAL captura. Checar e reivindicar sob _state_lock deixa isso
+        # atomico em relacao ao _confirmar_captura: ou ele ve a captura
+        # reivindicada, ou este begin ve o ditado cancelado.
+        with _state_lock:
+            if not (_recording and _rec_gen == gen):
+                return False
+            _cap_gen = gen
+            _begins_pendentes.discard(gen)
         beep(880)   # so apita quando a captura de fato comecou
         _frames = []
         _enc = _StreamEncoder()
@@ -1518,12 +1548,17 @@ def _begin_capture():
     return True
 
 
-def _end_capture():
-    """Desliga a captura e devolve os frames por valor (evita a race do _frames
-    global). O _capture_lock faz o stop ESPERAR um begin em curso: ditado curto
-    pode soltar a tecla antes de o dispositivo ter aberto."""
-    global _frames, _enc, _capturing, _warm_until
+def _end_capture(gen):
+    """Desliga a captura do aperto `gen` e devolve os frames por valor (evita a
+    race do _frames global). O _capture_lock faz o stop ESPERAR um begin em
+    curso: ditado curto pode soltar a tecla antes de o dispositivo ter aberto."""
+    global _frames, _enc, _capturing, _warm_until, _cap_gen
     with _capture_lock:
+        if _cap_gen != gen:
+            # a captura deste aperto nunca comecou (cancelada ou microfone nao
+            # abriu); a que estiver em curso, se houver, e de outro aperto.
+            return [], None
+        _cap_gen = None
         was = _capturing
         _capturing = False
         frames, _frames = _frames, []
@@ -1551,27 +1586,50 @@ def slot_handsfree_stop():
     _handsfree_stop()
 
 
-def _start_audio(mode):
+def _start_audio(mode, gen):
     """Abre o microfone FORA da thread da UI e liga a captura. Se falhar, desfaz
     o estado logico e manda esconder a pill pelo sinal (hide so na thread da UI)."""
     global _recording, _rec_mode
-    if _begin_capture():
+    if _begin_capture(gen):
         log("Gravando..." if mode == "hold" else "Gravando (maos-livres)...")
         return
     with _state_lock:
+        _begins_pendentes.discard(gen)
         # so desfaz se o estado ainda e o DESTE start: enquanto o dispositivo
-        # abria, o ditado pode ter terminado (o stop ja escondeu a pill) ou um
-        # novo pode ter comecado — nos dois casos nao ha nada a desfazer aqui.
-        if not (_recording and _rec_mode == mode):
+        # abria, o ditado pode ter terminado (o stop ja escondeu a pill), o prazo
+        # de confirmacao pode ter vencido (a pill ja avisou) ou um novo pode ter
+        # comecado — em todos esses casos nao ha nada a desfazer aqui.
+        if not (_recording and _rec_gen == gen):
             return
         _recording = False
         _rec_mode = None
     bridge.abort.emit(mode)
 
 
-def _stop_and_transcribe(mode="hold", target_hwnd=None):
+def _confirmar_captura(gen, mode):
+    """Thread da UI, MIC_CONFIRM_S depois do aperto. Se o start deste aperto
+    ainda nao resolveu, o microfone nao respondeu: cancela o ditado e avisa, em
+    vez de deixar a pill contando tempo sem gravar nada.
+    Decisao: .specs/#05-microfone-sem-resposta/_ux-veredito.md"""
+    global _recording, _rec_mode
+    with _state_lock:
+        if gen not in _begins_pendentes:
+            return   # abriu, ou falhou dentro do prazo e ja avisou
+        _begins_pendentes.discard(gen)
+        if _recording and _rec_gen == gen:
+            _recording = False
+            _rec_mode = None
+        outro_gravando = _recording
+    log(f"[audio] microfone nao abriu em {MIC_CONFIRM_S:.0f}s; ditado cancelado")
+    if outro_gravando:
+        return   # a pill e de um ditado mais novo (caso (b) do #03)
+    beep(220, 280)   # o aviso chega no meio da fala: so a pill nao basta
+    (hf_window if mode == "handsfree" else overlay).show_done(-4.0)
+
+
+def _stop_and_transcribe(gen, mode="hold", target_hwnd=None):
     """Fecha a captura (esperando um begin em curso) e transcreve. Fora da UI."""
-    frames, enc = _end_capture()
+    frames, enc = _end_capture(gen)
     worker(frames, mode=mode, target_hwnd=target_hwnd, enc=enc)
 
 
@@ -1593,15 +1651,20 @@ def slot_normalizing(mode):
 
 
 def _handsfree_start():
-    global _recording, _rec_mode, _hf_target_hwnd
+    global _recording, _rec_mode, _hf_target_hwnd, _rec_gen
     with _state_lock:
         if _recording:
             return
         _recording = True
         _rec_mode = "handsfree"
+        _rec_gen += 1
+        gen = _rec_gen
+        _begins_pendentes.add(gen)
     _hf_target_hwnd = _get_foreground()   # captura o alvo ANTES de abrir a pill
     hf_window.show_recording()            # visual instantaneo (pill nao rouba foco)
-    threading.Thread(target=_start_audio, args=("handsfree",), daemon=True).start()
+    QTimer.singleShot(int(MIC_CONFIRM_S * 1000),
+                      lambda: _confirmar_captura(gen, "handsfree"))
+    threading.Thread(target=_start_audio, args=("handsfree", gen), daemon=True).start()
 
 
 def _handsfree_stop():
@@ -1611,10 +1674,12 @@ def _handsfree_stop():
             return
         _recording = False
         _rec_mode = None
+        gen = _rec_gen
     hf_window.show_busy()
     threading.Thread(
         target=_stop_and_transcribe,
-        kwargs=dict(mode="handsfree", target_hwnd=_hf_target_hwnd), daemon=True,
+        kwargs=dict(gen=gen, mode="handsfree", target_hwnd=_hf_target_hwnd),
+        daemon=True,
     ).start()
 
 
@@ -1626,9 +1691,10 @@ def slot_handsfree_cancel():
             return
         _recording = False
         _rec_mode = None
+        gen = _rec_gen
     hf_window.hide_it()
     # desmuta/limpa fora da UI: o _end_capture pode esperar um begin em curso
-    threading.Thread(target=_end_capture, daemon=True).start()
+    threading.Thread(target=_end_capture, args=(gen,), daemon=True).start()
     log("Maos-livres cancelado (ESC).")
 
 
@@ -1638,12 +1704,15 @@ def slot_start():
     virava um start novo na fila, cujo 'else: hide_it()' escondia a pill da
     gravacao em curso (86 ditados com visible=False no log). Ver a investigacao
     de 2026-08-03."""
-    global _recording, _rec_mode
+    global _recording, _rec_mode, _rec_gen
     with _state_lock:
         ja = _rec_mode if _recording else None
         if not ja:
             _recording = True
             _rec_mode = "hold"
+            _rec_gen += 1
+            gen = _rec_gen
+            _begins_pendentes.add(gen)
     if ja:
         # Hotkey redundante — tipicamente apertar o Ctrl do hold no meio de um
         # ditado maos-livres. Isso JA era um no-op seguro; o que faltava era
@@ -1655,7 +1724,8 @@ def slot_start():
     overlay.show_recording()
     if _t_press:
         log(f"[t] tecla->overlay {(time.perf_counter() - _t_press) * 1000:.0f}ms")
-    threading.Thread(target=_start_audio, args=("hold",), daemon=True).start()
+    QTimer.singleShot(int(MIC_CONFIRM_S * 1000), lambda: _confirmar_captura(gen, "hold"))
+    threading.Thread(target=_start_audio, args=("hold", gen), daemon=True).start()
 
 
 def slot_stop():
@@ -1665,10 +1735,11 @@ def slot_stop():
             return
         _recording = False
         _rec_mode = None
+        gen = _rec_gen
     overlay.show_busy()
     # frames entregues por valor pra evitar a race do _frames global (uma nova
     # gravacao zerava o audio da anterior — ver _end_capture).
-    threading.Thread(target=_stop_and_transcribe, daemon=True).start()
+    threading.Thread(target=_stop_and_transcribe, args=(gen,), daemon=True).start()
 
 
 def _norm_for_echo(s):
