@@ -25,7 +25,9 @@ import threading
 import datetime
 from collections import deque
 
-GUARD_PORT = 49734   # instancia unica (dictate usa 49732, supervisor 49733)
+import plataforma
+
+GUARD_PORT = plataforma.PORTA_HISTORICO   # instancia unica
 
 if __name__ == "__main__":
     # Se ja existe uma instancia residente, acorda a janela dela e sai AGORA —
@@ -1253,13 +1255,13 @@ def notify_existing():
 
 
 if __name__ == "__main__":
-    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        guard.bind(("127.0.0.1", GUARD_PORT))
-    except OSError:
+    guard, erro = plataforma.travar_instancia_unica(GUARD_PORT)
+    if erro == "ocupada":
         # ja tem uma instancia rodando: acorda a janela dela e sai
         notify_existing()
         sys.exit(0)
+    if erro:
+        raise SystemExit(f"Nao consegui o lock de instancia unica: {erro}")
 
     setTheme(Theme.DARK)
     setThemeColor(ORANGE)

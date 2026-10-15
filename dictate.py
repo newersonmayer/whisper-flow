@@ -2100,12 +2100,13 @@ def main():
     sys.excepthook = _log_uncaught
     threading.excepthook = _thread_excepthook
 
-    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        guard.bind(("127.0.0.1", 49732))
-    except OSError:
+    guard, erro = plataforma.travar_instancia_unica(plataforma.PORTA_DICTATE)
+    if erro == "ocupada":
         log("Ja existe uma instancia rodando. Saindo.")
         sys.exit(0)
+    if erro:
+        log(f"Nao consegui o lock de instancia unica: {erro}. Saindo.")
+        sys.exit(1)
 
     if not os.getenv("OPENAI_API_KEY"):
         log("OPENAI_API_KEY ausente no .env. Abortando.")
