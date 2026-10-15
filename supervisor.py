@@ -30,7 +30,6 @@ LOG = os.path.join(BASE, "supervisor.log")
 
 MIN_UPTIME = 5                  # rodou menos que isso = falhou no boot
 BACKOFF = [2, 5, 15, 30, 60]   # espera crescente entre quedas rapidas seguidas
-GUARD_PORT = 49733             # instancia unica do supervisor (dictate usa 49732)
 
 
 def log(msg):
@@ -44,11 +43,12 @@ def log(msg):
 
 def main():
     # instancia unica: se ja existe um supervisor, sai
-    guard = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    try:
-        guard.bind(("127.0.0.1", GUARD_PORT))
-    except OSError:
+    guard, erro = plataforma.travar_instancia_unica(plataforma.PORTA_SUPERVISOR)
+    if erro == "ocupada":
         log("Ja existe um supervisor rodando. Saindo.")
+        return
+    if erro:
+        log(f"Nao consegui o lock de instancia unica: {erro}. Saindo.")
         return
 
     if not os.path.exists(PYW):

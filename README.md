@@ -285,7 +285,9 @@ Em ambos, confirme no fim do `dictate.log` a linha `whisper-voice pronto`.
 - **Inicialização:** Tarefa Agendada do Windows (`registrar-tarefa.ps1`), com
   gatilho *no login* e *reinício automático* se o processo cair — monitorado pelo
   próprio Windows, sem polling. Instância única garantida por um lock na porta
-  `127.0.0.1:49732`.
+  `127.0.0.1:41732` (supervisor `41733`, app Transcrições `41734`). As portas
+  ficam abaixo de 49152 porque o Hyper-V/WSL reserva blocos da faixa dinâmica do
+  Windows a cada boot (ver `plataforma.travar_instancia_unica`).
 - **Resiliência:** cada áudio é salvo em `pendentes/` **antes** de ir pra API.
   Se o processo cair no meio de uma transcrição, o áudio é re-transcrito no próximo
   boot e salvo no histórico (não é colado, porque o cursor já estará em outro lugar).

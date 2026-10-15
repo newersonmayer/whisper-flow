@@ -47,6 +47,44 @@ def python_do_venv(console=False):
 
 
 # --------------------------------------------------------------------------
+# Instancia unica (lock por bind em 127.0.0.1)
+# --------------------------------------------------------------------------
+# As portas ficam ABAIXO de 49152 de proposito. A faixa dinamica do Windows
+# (49152-65535) e onde o Hyper-V/WSL reserva blocos de 100 portas a cada boot.
+# Em 15/10/2026 as antigas 49732-49734 cairam na reserva 49674-49773: o bind
+# passou a falhar com WinError 10013, o codigo leu isso como "ja existe
+# instancia" e o ditador ficou fora do ar sem erro nenhum no log.
+PORTA_DICTATE = 41732
+PORTA_SUPERVISOR = 41733
+PORTA_HISTORICO = 41734
+
+_WSAEADDRINUSE = 10048
+
+
+def travar_instancia_unica(porta):
+    """Tenta pegar o lock de instancia unica na porta.
+
+    Devolve (socket, None) se pegou — guarde o socket vivo enquanto o processo
+    rodar. (None, "ocupada") se outra instancia ja segura a porta. (None, texto)
+    em qualquer outro erro de bind (porta reservada pelo SO, permissao): nesse
+    caso NAO existe outra instancia, e quem chama deve logar o texto.
+    """
+    import errno
+    import socket
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.bind(("127.0.0.1", porta))
+        return s, None
+    except OSError as e:
+        s.close()
+        winerror = getattr(e, "winerror", None)
+        if e.errno == errno.EADDRINUSE or winerror == _WSAEADDRINUSE:
+            return None, "ocupada"
+        return None, f"bind em 127.0.0.1:{porta} falhou ({winerror or e.errno}): {e}"
+
+
+# --------------------------------------------------------------------------
 # Bipe de inicio/fim/erro da gravacao
 # --------------------------------------------------------------------------
 # No Windows: winsound.Beep, que aceita frequencia e duracao.
