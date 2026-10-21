@@ -839,6 +839,17 @@ def _reposicionar_no_rodape(window):
     window.move(x, y)
 
 
+def _gravando_em(modo):
+    """True quando a gravacao em curso usa a pill deste modo ("hold" ou
+    "handsfree"). Cada pill so cede a vez para uma gravacao NELA: o hold e o
+    maos-livres tem janelas separadas, e com o guard global o "pronto" do hold
+    era descartado enquanto um maos-livres gravava — e nada mais escondia a
+    pill, que ficava em "transcrevendo" ate o proximo ditado de hold (dictate.log
+    de 24/09/2026: 81 minutos).
+    Decisao: .specs/#03-colisoes-de-gravacao/overview.md item 3."""
+    return _recording and _rec_mode == modo
+
+
 class Overlay(QWidget):
     """Pill flutuante embaixo da tela. Estados: rec (onda + timer), busy
     (spinner + "transcrevendo"), done ("colado" verde) e fail (erro vermelho).
@@ -912,7 +923,7 @@ class Overlay(QWidget):
     def show_busy(self):
         log(f"[diag] updates={self._n} maxlvl={self._max:.3f} "
             f"visible={self.isVisible()} geo={self.x()},{self.y()} {self.width()}x{self.height()}")
-        if _recording:
+        if _gravando_em("hold"):
             # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
             # inteiro — transcreve, normaliza, salva no historico e cola; so perde
             # a vez no visual. Mesmo guard que o show_done ja tinha.
@@ -923,7 +934,7 @@ class Overlay(QWidget):
 
     def show_norm(self):
         """Fase 2: transcricao pronta, passe de formatacao rodando."""
-        if _recording:
+        if _gravando_em("hold"):
             # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
             # inteiro — transcreve, normaliza, salva no historico e cola; so perde
             # a vez no visual. Mesmo guard que o show_done ja tinha.
@@ -933,7 +944,7 @@ class Overlay(QWidget):
         self.update()
 
     def show_done(self, secs):
-        if _recording:   # uma nova gravacao ja comecou; nao esconde o overlay dela
+        if _gravando_em("hold"):   # um novo hold ja comecou; nao esconde a pill dele
             return
         if secs >= 0:
             self._flash("done", f"colado · {secs:.1f}s", 900)
@@ -964,7 +975,7 @@ class Overlay(QWidget):
         QTimer.singleShot(ms, lambda: self._end_flash(mode))
 
     def _end_flash(self, mode):
-        if self.mode == mode and not _recording:
+        if self.mode == mode and not _gravando_em("hold"):
             self.hide_it()
 
     def hide_it(self):
@@ -1066,7 +1077,7 @@ class HandsFreeWindow(QWidget):
         self.update()
 
     def show_busy(self):
-        if _recording:
+        if _gravando_em("handsfree"):
             # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
             # inteiro — transcreve, normaliza, salva no historico e cola; so perde
             # a vez no visual. Mesmo guard que o show_done ja tinha.
@@ -1077,7 +1088,7 @@ class HandsFreeWindow(QWidget):
         self.update()
 
     def show_norm(self):
-        if _recording:
+        if _gravando_em("handsfree"):
             # Uma gravacao NOVA ja comecou e a pill e dela. O ditado antigo segue
             # inteiro — transcreve, normaliza, salva no historico e cola; so perde
             # a vez no visual. Mesmo guard que o show_done ja tinha.
@@ -1087,7 +1098,7 @@ class HandsFreeWindow(QWidget):
         self.update()
 
     def show_done(self, secs):
-        if _recording and _rec_mode == "handsfree":
+        if _gravando_em("handsfree"):
             return   # uma nova gravacao maos-livres ja comecou
         self.btn.hide()
         if secs >= 0:
@@ -1115,7 +1126,7 @@ class HandsFreeWindow(QWidget):
         QTimer.singleShot(ms, lambda: self._end_flash(mode))
 
     def _end_flash(self, mode):
-        if self.mode == mode and not (_recording and _rec_mode == "handsfree"):
+        if self.mode == mode and not _gravando_em("handsfree"):
             self.hide_it()
 
     def hide_it(self):
