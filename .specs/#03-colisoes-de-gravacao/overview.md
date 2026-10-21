@@ -35,6 +35,17 @@ repintava a pill da gravação nova com "organizando…".
 O ditado antigo **não é cancelado**: transcreve, normaliza, salva no histórico e
 cola normalmente. Só perde a vez no visual.
 
+**Correção de 21/10/2026: a pill só cede a vez para uma gravação nela mesma.**
+O guard era a flag global `_recording`, mas o hold e o mãos-livres têm janelas
+separadas. Com um mãos-livres gravando, o `show_done()` do hold era descartado e
+nada mais escondia a pill do hold: ela ficava em "transcrevendo" até o próximo
+ditado de hold. Caso real no `dictate.log` de 24/09/2026: às 07:25:54 o hold parou
+e um mãos-livres começou no mesmo segundo; o mãos-livres gravou 81 min e, pelo
+código, a pill do hold ficou em "transcrevendo" esse tempo todo (a tela não foi
+vista; o Isaque relatou o mesmo sintoma e precisava reiniciar o programa). Agora as duas janelas usam `_gravando_em(modo)`:
+o `Overlay` só cede para um hold novo e a `HandsFreeWindow` só para um mãos-livres
+novo. Teste: `tests/test_pill_colisao.py`.
+
 ### 4. Transcrição ganha teto de tempo proporcional ao áudio
 
 Não havia `timeout` na chamada de transcrição, então valia o da SDK:
