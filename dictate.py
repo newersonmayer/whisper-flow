@@ -189,6 +189,15 @@ EXIT_DRIVER_TRAVADO = 75   # aparece no supervisor.log como rc=75
 LOG_PATH = os.path.join(BASE, "dictate.log")
 HIST_DIR = os.path.join(BASE, "transcricoes")
 PEND_DIR = os.path.join(BASE, "pendentes")   # audios salvos antes de transcrever (sobrevivem a quedas)
+# Pendente que a API nunca vai aceitar sai da fila e vai pra ca, intacto. Sem
+# isso, um WAV de 81 min recusado com 400 foi reenviado em todo boot por dois
+# meses e segurava o ditador nos primeiros minutos depois do login.
+PEND_QUARENTENA = os.path.join(PEND_DIR, "quarentena")
+# Teto de upload da API de transcricao (doc da OpenAI: "Files can be up to 25 MB").
+API_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
+# A recuperacao espera o login assentar: disco, antivirus e warmup disputam a
+# maquina nesse minuto, e o primeiro ditado do dia nao pode ficar atras dela.
+RECOVER_DELAY_S = float(os.getenv("RECOVER_DELAY", "60"))
 AUDIO_DIR = os.path.join(BASE, "audios")     # acervo dos audios ja transcritos (retencao rolling)
 AUDIO_RETENTION_DAYS = 7
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")           # editavel pelo app Transcricoes
@@ -1933,29 +1942,67 @@ def _safe_remove(path):
             log(f"falha ao remover {os.path.basename(path)}: {e}")
 
 
-def recover_pending():
+def _erro_definitivo(err):
+    """True quando a API recusou o arquivo em si (4xx), e reenviar da o mesmo
+    erro. 408 e 429 sao passageiros (timeout e limite de taxa): ficam na fila."""
+    m = re.match(r"Error code: (\d{3})", err or "")
+    return bool(m) and m.group(1).startswith("4") and m.group(1) not in ("408", "429")
+
+
+def _quarentenar(fp, motivo):
+    """Tira o audio da fila de recuperacao sem apagar: ele continua ouvivel."""
+    try:
+        os.makedirs(PEND_QUARENTENA, exist_ok=True)
+        shutil.move(fp, os.path.join(PEND_QUARENTENA, os.path.basename(fp)))
+        log(f"pendente {os.path.basename(fp)} foi para pendentes/quarentena: {motivo}")
+    except Exception as e:
+        log(f"falha ao mover {os.path.basename(fp)} para quarentena: {e}")
+
+
+def recover_pending(delay=None):
     """No boot, re-transcreve audios que ficaram em pendentes/ por uma queda.
-    Salva no historico (NAO cola — o cursor ja esta em outro lugar)."""
+    Salva no historico (NAO cola — o cursor ja esta em outro lugar).
+
+    A lista sai ANTES da espera: um ditado feito nesse minuto tambem passa por
+    pendentes/, e pegar o arquivo dele aqui transcreveria a mesma fala duas vezes."""
     try:
         files = sorted(glob.glob(os.path.join(PEND_DIR, "*.wav")))
     except Exception:
         return
     if not files:
         return
-    log(f"Recuperando {len(files)} audio(s) pendente(s) de uma queda anterior...")
+    delay = RECOVER_DELAY_S if delay is None else delay
+    log(f"Recuperando {len(files)} audio(s) pendente(s) de uma queda anterior "
+        f"daqui a {delay:.0f}s...")
+    time.sleep(delay)
     for fp in files:
+        if not os.path.exists(fp):
+            continue
         name = os.path.basename(fp)
         try:
             data, sr = sf.read(fp, dtype="int16")
+        except Exception as e:
+            _quarentenar(fp, f"wav ilegivel ({str(e)[:60]})")
+            continue
+        try:
+            dur = len(data) / float(sr)
             bio = encode_upload(data, sr)
-            text, err = transcribe_bytes(bio, len(data) / float(sr))
+            del data   # o array do wav inteiro nao precisa durar o upload
+            tamanho = bio.getbuffer().nbytes
+            if tamanho > API_UPLOAD_MAX_BYTES:
+                _quarentenar(fp, f"{tamanho / 1e6:.0f} MB passa do teto de 25 MB da API "
+                                 f"({dur / 60:.0f} min de audio)")
+                continue
+            text, err = transcribe_bytes(bio, dur)
             if text and not err:
                 # mesmo passe do ditado normal (a duracao sai do proprio wav)
-                text = normalizar_texto(text, len(data) / float(sr))
+                text = normalizar_texto(text, dur)
                 now = datetime.datetime.now()
                 save_history(text, now)
                 log(f"recuperado [{name}] -> {text}")
                 archive_audio(fp, now)
+            elif _erro_definitivo(err):
+                _quarentenar(fp, f"a API recusou ({err})")
             else:
                 log(f"nao recuperei {name} ({err or 'vazio'}); mantendo pra proxima.")
         except Exception:
