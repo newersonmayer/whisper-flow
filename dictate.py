@@ -198,6 +198,10 @@ API_UPLOAD_MAX_BYTES = 25 * 1024 * 1024
 # A recuperacao espera o login assentar: disco, antivirus e warmup disputam a
 # maquina nesse minuto, e o primeiro ditado do dia nao pode ficar atras dela.
 RECOVER_DELAY_S = float(os.getenv("RECOVER_DELAY", "60"))
+# Piso de memoria que o Windows nao tira do ditador (0 desliga). Sem ele, com
+# Docker apertando a RAM, o processo ia pro disco e o aperto da tecla esperava
+# o Windows trazer tudo de volta: 13s a 140s no dictate.log.
+RAM_MINIMA_MB = int(os.getenv("RAM_MINIMA_MB", "256"))
 AUDIO_DIR = os.path.join(BASE, "audios")     # acervo dos audios ja transcritos (retencao rolling)
 AUDIO_RETENTION_DAYS = 7
 VOCAB_PATH = os.path.join(BASE, "vocabulario.txt")           # editavel pelo app Transcricoes
@@ -2222,6 +2226,10 @@ def main():
         log(("[!] " if not ok_acess else "") + aviso)
 
     _avisar_colisao_de_hotkey()
+
+    aviso_ram = plataforma.garantir_memoria_minima(RAM_MINIMA_MB)
+    if aviso_ram:
+        log(f"[ram] {aviso_ram}")
 
     log(f"whisper-voice pronto ({plataforma.nome_do_sistema()}). "
         f"Segura {HOTKEY_LABEL}, fala, solta. "

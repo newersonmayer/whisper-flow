@@ -5,12 +5,14 @@ import os
 import pathlib
 import re
 import shutil
+import sys
 import tempfile
 import time
 import unittest
 from unittest.mock import Mock
 
 SOURCE = pathlib.Path(__file__).resolve().parents[1] / "dictate.py"
+sys.path.insert(0, str(SOURCE.parent))
 
 
 def load_recovery(pend_dir, sf, transcribe, encode=None):
@@ -108,6 +110,32 @@ class RecuperacaoTest(unittest.TestCase):
         g["time"] = Mock()
         g["recover_pending"]()
         g["time"].sleep.assert_not_called()
+
+
+@unittest.skipUnless(os.name == "nt", "so Windows")
+class MemoriaMinimaTest(unittest.TestCase):
+    def test_piso_duro_fica_registrado_no_processo(self):
+        import ctypes
+        from ctypes import wintypes
+        import plataforma
+
+        msg = plataforma.garantir_memoria_minima(64)
+        self.assertEqual(msg, "memoria minima garantida: 64 MB")
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        mn, mx, fl = ctypes.c_size_t(), ctypes.c_size_t(), wintypes.DWORD()
+        k32.GetProcessWorkingSetSizeEx.argtypes = [
+            wintypes.HANDLE, ctypes.POINTER(ctypes.c_size_t),
+            ctypes.POINTER(ctypes.c_size_t), ctypes.POINTER(wintypes.DWORD)]
+        self.assertTrue(k32.GetProcessWorkingSetSizeEx(
+            k32.GetCurrentProcess(), ctypes.byref(mn), ctypes.byref(mx), ctypes.byref(fl)))
+        self.assertEqual(mn.value, 64 * 1024 * 1024)
+        self.assertTrue(fl.value & 0x1, "piso duro (HARDWS_MIN_ENABLE) ausente")
+
+    def test_zero_desliga(self):
+        import plataforma
+        self.assertIsNone(plataforma.garantir_memoria_minima(0))
 
 
 if __name__ == "__main__":
