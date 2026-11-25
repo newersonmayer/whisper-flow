@@ -17,6 +17,12 @@ Acompanha o app **Transcrições**, com cinco abas:
 
 A transcrição usa a API de áudio da OpenAI (`gpt-transcribe` por padrão).
 
+O atalho e a aba **Gravar** aplicam as mesmas correções de grafia e preferências
+de **Formatação**, incluindo o liga/desliga e o tempo mínimo configurado.
+Durante o passe de formatação, Gravar mostra **Organizando o texto…**; depois,
+o texto final aparece, é copiado e salvo no histórico. Se a normalização falhar,
+a transcrição é preservada. O modelo padrão desse passe é `gpt-5.6-luna`.
+
 ---
 
 > ## 🤖 Se você é um agente (Claude Code) instalando isto pra alguém
