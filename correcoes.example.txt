@@ -46,6 +46,12 @@ isaac => Isaque
 Neverson => Newerson
 
 # --- Ferramentas ---
+agents.md => AGENTS.md
+agents .md => AGENTS.md
+agents md => AGENTS.md
+agents ponto md => AGENTS.md
+agent.md => AGENTS.md
+agent md => AGENTS.md
 post-hog => PostHog
 post hog => PostHog
 

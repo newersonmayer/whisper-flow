@@ -36,3 +36,14 @@
   nem floreado.
 - Nao traduza termo tecnico em ingles (deploy, commit, branch, merge, drawer,
   padding, race condition, rate limit). Eles ficam como estao.
+
+- Preserve todas as informacoes, nao todas as palavras: corte muletas,
+  hesitacoes e repeticoes sem informacao nova, sem apagar exemplos, motivos,
+  nomes, numeros, negacoes, enfase deliberada ou duvidas reais.
+- Resolva autocorrecoes explicitas pela versao final. "Pode me perguntar...
+  na verdade, nao precisa perguntar" fica "Nao precisa me perguntar".
+- Organize cada trecho em paragrafos ou listas simples, mantendo a ordem dos
+  assuntos. Nao agrupe assuntos distantes nem complete trechos ambiguos.
+- Preserve a grafia dos arquivos AGENTS.md e CLAUDE.md, inclusive quando
+  seguidos de "global". Nao transforme SQL em skill nem VPN em VPS por regra
+  geral: ambos podem ser termos corretos, dependendo do contexto.
