@@ -257,6 +257,48 @@ def area_trabalho_do_cursor():
 
 
 # --------------------------------------------------------------------------
+# Memoria minima garantida (o ditador nao vai pro disco)
+# --------------------------------------------------------------------------
+_HARDWS_MIN_ENABLE = 0x1   # o working set nao cai abaixo do minimo
+_HARDWS_MAX_DISABLE = 0x8  # o maximo continua so uma sugestao
+
+
+def garantir_memoria_minima(mb):
+    """Pede ao Windows um piso de RAM que ele nao tira do processo.
+
+    Sem o piso, o Windows manda pro disco a memoria de um processo parado
+    sempre que outro aperta a RAM, e o proximo aperto da tecla espera tudo
+    voltar. O piso duro (SetProcessWorkingSetSizeEx com HARDWS_MIN_ENABLE)
+    impede esse corte. O custo e o mesmo valor de RAM a menos pro resto da
+    maquina. A doc diz que "all users generally have" o privilegio exigido.
+
+    Devolve a linha de log, ou None quando nao se aplica (macOS, mb <= 0).
+    """
+    if not IS_WIN or mb <= 0:
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.GetCurrentProcess.restype = wintypes.HANDLE
+        k32.SetProcessWorkingSetSizeEx.argtypes = [
+            wintypes.HANDLE, ctypes.c_size_t, ctypes.c_size_t, wintypes.DWORD]
+        k32.SetProcessWorkingSetSizeEx.restype = wintypes.BOOL
+
+        minimo = int(mb) * 1024 * 1024
+        maximo = minimo * 4
+        ok = k32.SetProcessWorkingSetSizeEx(
+            k32.GetCurrentProcess(), minimo, maximo,
+            _HARDWS_MIN_ENABLE | _HARDWS_MAX_DISABLE)
+        if ok:
+            return f"memoria minima garantida: {mb} MB"
+        return f"nao consegui garantir {mb} MB de memoria (WinError {ctypes.get_last_error()})"
+    except Exception as e:
+        return f"nao consegui garantir memoria minima: {str(e)[:80]}"
+
+
+# --------------------------------------------------------------------------
 # Diagnostico (usado pelo instalador e pelo log de boot)
 # --------------------------------------------------------------------------
 def nome_do_sistema():
