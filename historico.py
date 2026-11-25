@@ -25,6 +25,7 @@ import threading
 import datetime
 from collections import deque
 
+import normalizacao
 import plataforma
 
 GUARD_PORT = plataforma.PORTA_HISTORICO   # instancia unica
@@ -324,7 +325,7 @@ def load_vocab_editor():
     return DEFAULT_VOCAB
 
 
-def transcribe(audio, sr=SR):
+def transcribe(audio, sr=SR, on_normalizing=None):
     """audio: np.int16 mono. Retorna (texto, erro).
 
     O teto por tentativa e o mesmo do dictate.py e existe pelo mesmo motivo: sem
@@ -344,11 +345,19 @@ def transcribe(audio, sr=SR):
         try:
             bio.seek(0)
             r = get_client().with_options(max_retries=0).audio.transcriptions.create(**kwargs)
-            return (r.text or "").strip(), None
+            break
         except Exception as e:
             err = str(e)[:140]
             time.sleep(0.5)
-    return "", err
+    else:
+        return "", err
+
+    text = normalizacao.corrigir_termos((r.text or "").strip())
+    text = normalizacao.normalizar_texto(
+        text, len(audio) / float(sr), client=get_client(),
+        on_normalizing=on_normalizing,
+    )
+    return text, None
 
 
 def repolish(w):
@@ -413,6 +422,7 @@ class WaveWidget(QWidget):
 
 class RecordBridge(QObject):
     done = pyqtSignal(str, str)   # (texto, erro)
+    normalizing = pyqtSignal()
 
 
 class RecordPanel(QWidget):
@@ -431,6 +441,7 @@ class RecordPanel(QWidget):
 
         self.bridge = RecordBridge()
         self.bridge.done.connect(self._on_done)
+        self.bridge.normalizing.connect(self._on_normalizing)
 
         v = QVBoxLayout(self)
         v.setContentsMargins(28, 24, 28, 24)
@@ -442,7 +453,8 @@ class RecordPanel(QWidget):
 
         hint = QLabel(
             "Clica em Gravar e fala à vontade — pode clicar, rolar a tela e "
-            "trocar de janela enquanto grava. Clica de novo pra parar e transcrever."
+            "trocar de janela enquanto grava. Clica de novo pra parar e transcrever. "
+            "A organização do texto segue suas preferências de Formatação."
         )
         hint.setObjectName("hint")
         hint.setWordWrap(True)
@@ -540,8 +552,14 @@ class RecordPanel(QWidget):
         threading.Thread(target=self._worker, args=(audio,), daemon=True).start()
 
     def _worker(self, audio):
-        text, err = transcribe(audio)
+        try:
+            text, err = transcribe(audio, on_normalizing=self.bridge.normalizing.emit)
+        except Exception as exc:
+            text, err = "", str(exc)
         self.bridge.done.emit(text, err or "")
+
+    def _on_normalizing(self):
+        self.status.setText("Organizando o texto…")
 
     def _on_done(self, text, err):
         self.btn.setEnabled(True)
